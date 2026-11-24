@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>SeeThrough Viewer</title>
+  <meta name="description" content="SeeThrough headset viewer: see objects in other rooms as glowing outlines through walls.">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="hud" id="hud" aria-label="Viewer controls">
+      <header class="row" style="justify-content: space-between">
+        <h1><span class="logo-mark" aria-hidden="true"></span>SeeThrough</h1>
+        <div class="row">
+          <span class="pill" id="status-pill"><span class="dot"></span><span id="status-text">offline</span></span>
+          <button class="btn small hud-toggle" id="hud-toggle" aria-expanded="true">Hide</button>
+        </div>
+      </header>
+
+      <section aria-labelledby="h-conn">
+        <h2 id="h-conn">Connection</h2>
+        <label class="field">Relay URL <span class="muted" style="font-size: 11px">(blank = this browser only)</span>
+          <input type="url" id="relay" placeholder="wss://192.168.1.20:8443/ws" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="row">
+          <label class="field grow">Room code
+            <input type="text" id="room" maxlength="12" autocomplete="off" spellcheck="false" style="text-transform: uppercase">
+          </label>
+          <button class="btn" id="connect" style="align-self: end">Connect</button>
+        </div>
+        <div class="row">
+          <button class="btn" id="sim-toggle" aria-pressed="false">Start simulator</button>
+          <a class="btn" id="open-node" href="node.html" target="_blank" rel="noopener">Open camera node</a>
+        </div>
+      </section>
+
+      <section aria-labelledby="h-stats">
+        <h2 id="h-stats">Live</h2>
+        <div class="stats">
+          <div class="stat"><b id="st-objects">0</b><span>objects</span></div>
+          <div class="stat"><b id="st-latency">–</b><span>latency ms</span></div>
+          <div class="stat"><b id="st-rate">0</b><span>updates/s</span></div>
+        </div>
+        <div class="muted" id="align-status">Desktop view. In a headset, press Enter AR.</div>
+      </section>
+
+      <section aria-labelledby="h-view">
+        <h2 id="h-view">View</h2>
+        <div class="seg" role="group" aria-label="Camera mode">
+          <button id="mode-walk" aria-pressed="true">Walk</button>
+          <button id="mode-orbit" aria-pressed="false">Overview</button>
+        </div>
+        <label class="switch">X-ray (show through walls) <input type="checkbox" id="t-xray" checked></label>
+        <label class="switch">Distance labels <input type="checkbox" id="t-labels" checked></label>
+        <label class="switch">Camera positions <input type="checkbox" id="t-cams" checked></label>
+        <label class="switch">Markers <input type="checkbox" id="t-markers" checked></label>
+        <label class="switch" id="truth-row" hidden>Ground truth (simulator) <input type="checkbox" id="t-truth"></label>
+      </section>
+
+      <section aria-labelledby="h-filter">
+        <h2 id="h-filter">Object types</h2>
+        <div class="row" id="filters"><span class="muted">Nothing seen yet.</span></div>
+      </section>
+
+      <section aria-labelledby="h-cams">
+        <h2 id="h-cams">Cameras</h2>
+        <div class="cam-list" id="cams"><span class="muted">No cameras connected.</span></div>
+      </section>
+    </aside>
+
+    <div class="xr-slot" id="xr-slot"></div>
+    <div class="hint" id="hint">Walk: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> · drag to look</div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </div>
+  <script type="module" src="js/viewer/main.js"></script>
+</body>
+</html>

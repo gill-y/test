@@ -3,24 +3,170 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>test</title>
+  <title>SeeThrough</title>
+  <meta name="description" content="Mixed-reality x-ray vision: cameras in other rooms, glowing outlines in your headset, drawn through the walls.">
+  <link rel="stylesheet" href="css/app.css">
   <style>
-    :root { --bg: #0f1115; --fg: #e8e8ea; --muted: #9a9ca3; --accent: #7aa2ff; }
-    @media (prefers-color-scheme: light) { :root { --bg: #fafafa; --fg: #16181d; --muted: #5b5e66; --accent: #2f5bd3; } }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
-           background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
-    main { max-width: 560px; }
-    h1 { margin: 0 0 8px; font-size: 2rem; }
-    p { margin: 0 0 12px; color: var(--muted); }
-    a { color: var(--accent); }
+    body { overflow: auto; }
+    .page { max-width: 1080px; margin: 0 auto; padding: 0 16px 72px; }
+    nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 0; }
+    nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); text-decoration: none; }
+    nav .links { display: flex; gap: 6px; flex-wrap: wrap; }
+    nav .links a { color: var(--muted); text-decoration: none; padding: 10px 12px; border-radius: 10px; min-height: 44px; display: inline-flex; align-items: center; }
+    nav .links a:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+
+    .hero { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 40px; align-items: center; padding: 40px 0 56px; }
+    .eyebrow { color: var(--accent); font: 600 13px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; margin: 0 0 14px; }
+    .hero h1 { font-size: clamp(34px, 5.4vw, 56px); line-height: 1.04; letter-spacing: -0.02em; margin: 0 0 18px; }
+    .hero h1 em { font-style: normal; color: var(--accent); text-shadow: 0 0 24px rgba(56, 232, 255, 0.45); }
+    .hero p.lead { color: #b6c3d3; font-size: 18px; line-height: 1.6; margin: 0 0 26px; max-width: 54ch; }
+    .cta { display: flex; gap: 10px; flex-wrap: wrap; }
+    .cta .btn { min-height: 46px; padding: 10px 18px; font-size: 15px; }
+
+    .scene { position: relative; aspect-ratio: 4 / 3; border-radius: 18px; border: 1px solid var(--line); background: radial-gradient(120% 90% at 30% 20%, #121a28, #070a10 70%); overflow: hidden; }
+    .scene svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .glow { filter: drop-shadow(0 0 6px currentColor); }
+    @media (prefers-reduced-motion: no-preference) {
+      .walker { animation: walk 7s ease-in-out infinite alternate; }
+      .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    }
+    @keyframes walk { from { transform: translateX(0); } to { transform: translateX(70px); } }
+    @keyframes pulse { 50% { opacity: 0.55; } }
+
+    h2.section { font-size: 13px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; margin: 0 0 16px; font-weight: 600; }
+    .steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 56px; }
+    .step { background: var(--panel-solid); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
+    .step .num { font: 600 12px var(--mono); color: var(--accent); }
+    .step h3 { margin: 6px 0 6px; font-size: 17px; }
+    .step p { margin: 0; color: var(--muted); line-height: 1.55; }
+    .icon { width: 22px; height: 22px; stroke: var(--accent); fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+    .tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-bottom: 56px; }
+    .tool { display: grid; grid-template-columns: auto 1fr; gap: 14px; align-items: start; padding: 18px; border-radius: var(--radius); border: 1px solid var(--line); background: rgba(255, 255, 255, 0.02); color: var(--text); text-decoration: none; cursor: pointer; transition: border-color 0.2s, background 0.2s; }
+    .tool:hover { border-color: rgba(56, 232, 255, 0.5); background: rgba(56, 232, 255, 0.05); }
+    .tool:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .tool .ic { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; background: rgba(56, 232, 255, 0.1); }
+    .tool h3 { margin: 0 0 4px; font-size: 16px; }
+    .tool p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+
+    .note { border: 1px solid rgba(255, 210, 63, 0.35); background: rgba(255, 210, 63, 0.05); border-radius: var(--radius); padding: 16px 18px; color: #e7dcb4; line-height: 1.55; }
+    footer { margin-top: 40px; color: var(--faint); font-size: 13px; }
+
+    @media (max-width: 860px) {
+      .hero { grid-template-columns: 1fr; padding-top: 16px; }
+      .steps, .tools { grid-template-columns: 1fr; }
+      .hero p.lead { font-size: 16px; }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <h1>It's live.</h1>
-    <p>This page is served by GitHub Pages from <a href="https://github.com/gill-y/test">gill-y/test</a>.</p>
-    <p>Edit <code>index.html</code>, push to <code>main</code>, and it updates here in about a minute.</p>
-  </main>
+  <div class="page">
+    <nav aria-label="Main">
+      <a class="brand" href="index.html"><span class="logo-mark" aria-hidden="true"></span>SeeThrough</a>
+      <div class="links">
+        <a href="viewer.html?sim=1">Simulator</a>
+        <a href="node.html">Camera node</a>
+        <a href="markers.html">Markers</a>
+        <a href="https://github.com/gill-y/test#readme">Docs</a>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Mixed reality · WebXR · Quest 3</p>
+        <h1>See what's in the next room, <em>through the wall.</em></h1>
+        <p class="lead">Cameras you own watch other rooms and work out where people and objects are. Your headset draws a glowing outline of each one in its real position, visible through walls and furniture.</p>
+        <div class="cta">
+          <a class="btn primary" href="viewer.html?sim=1">Try the simulator</a>
+          <a class="btn" href="node.html">Start a camera node</a>
+          <a class="btn" href="markers.html">Print markers</a>
+        </div>
+      </div>
+      <div class="scene" role="img" aria-label="Illustration: a viewer on one side of a wall sees glowing outlines of a person and a dog in the room behind it.">
+        <svg viewBox="0 0 400 300" aria-hidden="true">
+          <defs>
+            <pattern id="g" width="20" height="20" patternUnits="userSpaceOnUse"><path d="M20 0H0V20" fill="none" stroke="#141c28" /></pattern>
+          </defs>
+          <rect width="400" height="300" fill="url(#g)" />
+          <rect x="190" y="40" width="16" height="230" fill="#2a3242" />
+          <rect x="190" y="40" width="16" height="230" fill="none" stroke="#3b4659" />
+          <!-- viewer -->
+          <circle cx="90" cy="150" r="12" fill="none" stroke="#e6edf5" stroke-width="2" />
+          <path d="M102 150 L360 120 M102 150 L360 185" stroke="#38e8ff" stroke-opacity="0.18" stroke-width="1.5" stroke-dasharray="4 5" />
+          <!-- camera in the other room -->
+          <g transform="translate(345 58)">
+            <rect x="-14" y="-9" width="28" height="18" rx="3" fill="none" stroke="#ff4fd8" stroke-width="2" />
+            <circle r="4" fill="#ff4fd8" class="pulse" />
+            <path d="M-12 9 L-60 80 M12 9 L10 95" stroke="#ff4fd8" stroke-opacity="0.35" />
+          </g>
+          <!-- person -->
+          <g class="walker" style="color:#38e8ff">
+            <g class="glow">
+              <circle cx="250" cy="118" r="11" fill="none" stroke="currentColor" stroke-width="2.5" />
+              <rect x="237" y="132" width="26" height="62" rx="13" fill="rgba(56,232,255,0.08)" stroke="currentColor" stroke-width="2.5" />
+              <ellipse cx="250" cy="200" rx="22" ry="5" fill="none" stroke="currentColor" stroke-width="1.5" />
+            </g>
+            <rect x="210" y="88" width="80" height="18" rx="9" fill="rgba(6,10,18,0.8)" stroke="currentColor" />
+            <text x="250" y="101" text-anchor="middle" fill="#fff" font-size="10" font-family="system-ui, sans-serif">Person · 4.2 m</text>
+          </g>
+          <!-- dog -->
+          <g style="color:#ffd23f" class="glow">
+            <rect x="282" y="212" width="46" height="26" fill="rgba(255,210,63,0.07)" stroke="currentColor" stroke-width="2" />
+            <path d="M282 212 l8 -6 h46 l-8 6 M328 212 l8 -6 v26 l-8 6" fill="none" stroke="currentColor" stroke-width="1.5" />
+          </g>
+          <rect x="270" y="246" width="70" height="17" rx="8.5" fill="rgba(6,10,18,0.8)" stroke="#ffd23f" />
+          <text x="305" y="258" text-anchor="middle" fill="#fff" font-size="10" font-family="system-ui, sans-serif">Dog · 5.6 m</text>
+        </svg>
+      </div>
+    </header>
+
+    <h2 class="section">How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M23 7l-7 5 7 5V7z" /><rect x="1" y="5" width="15" height="14" rx="2" /></svg>
+        <div class="num">01 · Camera nodes</div>
+        <h3>Detect on the device</h3>
+        <p>A phone, laptop, Raspberry Pi or IP camera runs object detection itself. Only positions are sent; video never leaves the device.</p>
+      </div>
+      <div class="step">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><path d="M14 14h3v3h-3zM18 18h3v3h-3z" /></svg>
+        <div class="num">02 · Shared map</div>
+        <h3>One coordinate system</h3>
+        <p>Printed markers on the walls tie every camera and headset into the same map. The headset links markers in different rooms by walking between them.</p>
+      </div>
+      <div class="step">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></svg>
+        <div class="num">03 · Headset viewer</div>
+        <h3>Outlines through walls</h3>
+        <p>On Quest, outlines are drawn in passthrough with depth testing off, colour-coded by camera, with distance labels, fading out when they stop updating.</p>
+      </div>
+    </div>
+
+    <h2 class="section">Open a tool</h2>
+    <div class="tools">
+      <a class="tool" href="viewer.html?sim=1">
+        <span class="ic"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3l14 9-14 9V3z" /></svg></span>
+        <span><h3>Simulator</h3><p>Fake cameras watching a fake house, on your desktop. Walk around with WASD and see people through the walls. No hardware needed.</p></span>
+      </a>
+      <a class="tool" href="viewer.html">
+        <span class="ic"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="7" width="20" height="10" rx="5" /><circle cx="8" cy="12" r="2" /><circle cx="16" cy="12" r="2" /></svg></span>
+        <span><h3>Headset viewer</h3><p>Open on your Quest from the relay server's HTTPS address and press Enter AR. Align by touching a marker.</p></span>
+      </a>
+      <a class="tool" href="node.html">
+        <span class="ic"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2" /><circle cx="12" cy="17" r="1" /></svg></span>
+        <span><h3>Camera node</h3><p>Turn a phone or laptop into a camera node. Calibrate it once on a marker, then leave it running.</p></span>
+      </a>
+      <a class="tool" href="markers.html">
+        <span class="ic"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9V2h12v7" /><rect x="6" y="14" width="12" height="8" /><path d="M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2" /></svg></span>
+        <span><h3>Printable markers</h3><p>ArUco markers at exact print size, one per page, with a 10 cm check line.</p></span>
+      </a>
+    </div>
+
+    <p class="note"><b>Only connect cameras you own</b>, pointed at places you're allowed to monitor. Every camera node shows a red "camera active" banner while it runs, and people in view should know it's there.</p>
+
+    <footer>
+      This page hosts the simulator and the static apps. Real cameras and headsets connect through the relay server you run on your own network (see the <a href="https://github.com/gill-y/test#readme">README</a>).
+    </footer>
+  </div>
 </body>
 </html>
