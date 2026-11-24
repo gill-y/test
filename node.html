@@ -12,6 +12,7 @@
     .node.live { padding-top: 48px; }
     .stage-wrap { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); aspect-ratio: 16 / 9; }
     .stage-wrap video, .stage-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+    .stage-wrap canvas.minimap { inset: auto; top: 10px; left: 10px; width: min(38%, 220px); height: auto; aspect-ratio: 1; }
     .stage-empty { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 24px; }
     .side { display: grid; gap: 14px; align-content: start; }
     .card { background: var(--panel-solid); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; display: grid; gap: 10px; }
@@ -64,6 +65,7 @@
       <div class="stage-wrap" id="stage">
         <video id="video" playsinline muted></video>
         <canvas id="overlay"></canvas>
+        <canvas class="minimap" id="minimap" width="400" height="400" hidden role="img" aria-label="Mini map: this camera, the headset, the other phones and everything they detect, seen from above"></canvas>
         <div class="stage-empty" id="stage-empty">
           <div>
             <p style="margin: 0 0 6px; color: var(--text); font-weight: 600">Camera is off</p>
@@ -110,6 +112,8 @@
           </label>
           <label class="field">Min. confidence <input type="number" id="minconf" min="0.1" max="0.95" step="0.05" value="0.5"></label>
         </div>
+        <label class="switch">Mini map <input type="checkbox" id="show-map" checked></label>
+        <label class="switch">Outline what other devices detect <input type="checkbox" id="show-remote" checked></label>
         <label class="switch">Send preview thumbnails <input type="checkbox" id="thumbs"></label>
         <p class="muted">Raw video never leaves this device. With thumbnails on, a small low-quality frame is sent every 2 s.</p>
       </section>

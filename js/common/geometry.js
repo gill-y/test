@@ -468,3 +468,45 @@ export function detectionToWorld(bbox, K, worldFromCam, label, depthMeters = nul
   centre.y = h / 2;
   return { p: [centre.x, centre.y, centre.z], s: [w, h, d], dist: centre.distanceTo(ray.origin) };
 }
+
+/**
+ * Where a device is on the floor and which way it faces, from its pose
+ * (world <- GL camera, looking down -Z). heading: 0 = facing -Z, clockwise from above.
+ */
+export function floorPose(worldFromCam) {
+  const e = worldFromCam.elements;
+  const fx = -e[8];
+  const fz = -e[10];
+  return { p: [e[12], e[14]], heading: Math.atan2(fx, -fz), height: e[13] };
+}
+
+/**
+ * The headset's pose in the world frame.
+ * xrFromWorld: the alignment (world -> headset tracking space).
+ * xrFromHead:  the viewer pose from WebXR (head -> headset tracking space).
+ */
+export function headWorldPose(xrFromWorld, xrFromHead) {
+  return xrFromWorld.clone().invert().multiply(xrFromHead);
+}
+
+/**
+ * Projects a world-space box (centre p, size s) into a camera image.
+ * Returns {x, y, w, h} in pixels, or null if the box is behind the camera or off screen.
+ */
+export function projectBox(p, s, K, worldFromCam, camFromWorld = worldFromCam.clone().invert()) {
+  let minU = Infinity, minV = Infinity, maxU = -Infinity, maxV = -Infinity;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < 8; i++) {
+    v.set(p[0] + (i & 1 ? 0.5 : -0.5) * s[0], p[1] + (i & 2 ? 0.5 : -0.5) * s[1], p[2] + (i & 4 ? 0.5 : -0.5) * s[2]);
+    v.applyMatrix4(camFromWorld);
+    if (v.z > -0.1) return null; // a corner is behind (or at) the camera
+    const u = K.cx + (K.f * v.x) / -v.z;
+    const vv = K.cy - (K.f * v.y) / -v.z;
+    minU = Math.min(minU, u);
+    maxU = Math.max(maxU, u);
+    minV = Math.min(minV, vv);
+    maxV = Math.max(maxV, vv);
+  }
+  if (maxU < 0 || maxV < 0 || minU > K.w || minV > K.h) return null;
+  return { x: minU, y: minV, w: maxU - minU, h: maxV - minV };
+}

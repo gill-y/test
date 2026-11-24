@@ -63,6 +63,7 @@
         <label class="switch">Distance labels <input type="checkbox" id="t-labels" checked></label>
         <label class="switch">Camera positions <input type="checkbox" id="t-cams" checked></label>
         <label class="switch">Markers <input type="checkbox" id="t-markers" checked></label>
+        <label class="switch">Mini map <input type="checkbox" id="t-minimap" checked></label>
         <label class="switch" id="truth-row" hidden>Ground truth (simulator) <input type="checkbox" id="t-truth"></label>
       </section>
 
@@ -77,6 +78,7 @@
       </section>
     </aside>
 
+    <canvas class="minimap" id="minimap" width="400" height="400" role="img" aria-label="Mini map: you, the phones, and everything they detect, seen from above"></canvas>
     <div class="xr-slot" id="xr-slot"></div>
     <div class="hint" id="hint">Walk: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> · drag to look</div>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>

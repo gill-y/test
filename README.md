@@ -2,6 +2,8 @@
 
 Mixed-reality "x-ray vision". Cameras you own watch other rooms and work out where people and objects are. Anyone wearing a connected headset sees a glowing outline of each object in its real position, drawn through walls and furniture, with a label like **Person · 4.2 m**.
 
+Sharing works both ways. The headset and every phone show what all the other devices detect, and every device has a **mini map** in its top-left corner. Only detections and device positions are shared, never video.
+
 **Live demo (simulator, no hardware):** https://gill-y.github.io/test/viewer.html?sim=1
 
 ```
@@ -125,6 +127,27 @@ On the Quest, open `https://<relay>:8443/viewer.html`, enter the room code, and 
 
 The full message list is at the top of [`js/common/protocol.js`](js/common/protocol.js).
 
+## Shared view: every device sees what the others detect
+
+The headset is a device in the room like any phone. Each device sends what it detects and where it is, and shows everyone else's detections:
+
+| Device | Sends | Shows |
+| --- | --- | --- |
+| Phone / laptop node | Its detections and its calibrated position | Mini map (top left of the video) with the headset, other phones and all detections. Things other devices detect are drawn as dashed outlines on its video, labelled "from Headset", even when they're behind a wall. |
+| Headset | Its position and facing direction (10 Hz, once aligned). With **Headset camera** on, also its own detections. | X-ray outlines of everything, plus a mini map fixed to the top left of your view that turns with you. |
+| Desktop viewer | Its walk-mode position (so you can test without a headset) | Mini map in the top-left corner. |
+
+**Mini map.** It shows the devices from above: phones with a wedge for their field of view, the headset as an arrow, and detections coloured by the device that made them. A white ring marks things that came from another device. In the headset the map turns with you and the rings are 1 m apart. On phones it points towards the marker wall and zooms to fit everything. Turn it off with **Mini map** (headset panel, viewer HUD, or the node's Room card).
+
+**Headset camera.** In the headset panel, press **Headset camera**, then press it again to confirm. The headset then runs the same COCO-SSD detector as the phones on its own camera and shares the results. Frames stay on the headset. The panel and the mini map show **● CAMERA ON** while it runs. It needs:
+
+- A Quest Browser and Horizon OS version that lets web pages use the headset cameras (Quest 3 / 3S). If it isn't supported, the panel says why and everything else keeps working.
+- The headset to be aligned to a marker, so its detections can be placed in the shared map.
+
+The camera's field of view is assumed to be 80° (`viewer.html?hfov=…` overrides it), and the camera's offset from your eyes is ignored. Expect headset detections to be rougher than a calibrated phone's: about 20–50 cm.
+
+Detections of the same thing from several devices are merged (same type, under 0.7 m apart), so the headset draws one outline and the phone doesn't draw a dashed copy of something it already sees.
+
 ## Viewer rendering
 
 - **People:** a capsule-and-head silhouette with a Fresnel rim glow.
@@ -172,3 +195,4 @@ To test the browser node without a camera, open `node.html?synthetic=1`. It rend
 | 3. Real detection | COCO-SSD (browser) and YOLO (Python) are wired up. The YOLO path still needs a run with `ultralytics` installed. |
 | 4. Multi-room linking | Map rooms mode is unit-tested with three rooms; needs a walk-through on a Quest. |
 | 5. Polish | Duplicate fusion, persistent anchors, FOV estimation, and small-marker handling are done. Ideas for next: WebXR depth-sensing occlusion when x-ray is off, and multi-camera triangulation. |
+| 6. Two-way sharing + mini map | Phone ↔ headset sharing, mini maps and dashed outlines tested in a browser through the relay (desktop viewer + simulator + synthetic phone node). **Headset camera detection not yet tried on a physical Quest.** |

@@ -1,4 +1,9 @@
 // SeeThrough viewer: desktop 3D view + WebXR passthrough viewer for Quest.
+//
+// The headset is a device in the room like any phone: it shows what every other
+// device detects, and it shares its own position and (with the headset camera
+// switched on) its own detections, so the phones see what it sees. Only object
+// positions are shared, never video.
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -6,9 +11,11 @@ import { ARButton } from 'three/addons/webxr/ARButton.js';
 import { openLink } from '../common/transport.js';
 import {
   qs, randomId, randomRoomCode, normalizeRoom, defaultRelayUrl, safeGet, safeSet, safeGetJSON, safeSetJSON,
-  colorForIndex, prettyLabel, FADE_START_S, FADE_END_S,
+  colorForIndex, prettyLabel, FADE_START_S, FADE_END_S, POSE_HZ, SEND_HZ, HEADSET_COLOR,
 } from '../common/protocol.js';
-import { msgToPose } from '../common/geometry.js';
+import { msgToPose, poseToMsg, floorPose, headWorldPose, intrinsicsFromFov, detectionToWorld } from '../common/geometry.js';
+import { Minimap } from '../common/minimap.js';
+import { Tracker } from '../common/tracker.js';
 import { ObjectVisual } from './xray.js';
 import { MarkerVisuals, CameraVisuals, buildSimHouse, TruthVisuals } from './scene-extras.js';
 import { XRPanel } from './xr-panel.js';
@@ -32,6 +39,8 @@ const state = {
   showCams: true,
   showMarkers: true,
   showTruth: false,
+  showMinimap: safeGet('seethrough.minimap') !== 'off',
+  selfPose: null, // Matrix4 world <- this headset / desktop view, or null when not aligned
   latency: null,
   updates: 0,
   rate: 0,
@@ -40,6 +49,9 @@ const state = {
   id: safeGet('seethrough.viewerId') || randomId('v-'),
 };
 safeSet('seethrough.viewerId', state.id);
+
+// This headset's own entry, used for its own detections (it is not in state.cameras).
+const selfSource = { index: -1, objCount: 0, lastSeen: 0, info: { id: state.id, name: 'This headset', color: HEADSET_COLOR, kind: 'headset' } };
 if (!state.room) state.room = randomRoomCode();
 
 // ------------------------------------------------------------------ three.js setup
@@ -183,9 +195,12 @@ function connect() {
     setMap(m.map);
     for (const c of m.cameras || []) onCamera(c);
     for (const t of m.thumbs || []) onThumb(t);
+    announceSelf();
   });
+  link.on('peer', (m) => m.joined && announceSelf());
   link.on('map', (m) => setMap(m.map));
   link.on('camera', onCamera);
+  link.on('pose', onPose);
   link.on('cameraGone', (m) => removeCamera(m.id));
   link.on('objects', onObjects);
   link.on('thumb', onThumb);
@@ -201,6 +216,7 @@ function clearRoomState() {
   state.cameras.clear();
   state.labelCounts.clear();
   state.camIndex = 0;
+  headCam.tracker = new Tracker({ prefix: 'h' });
   setMap(null);
   renderCameraList();
   renderFilters();
@@ -219,6 +235,7 @@ function setMap(map) {
 }
 
 function onCamera(info) {
+  if (info.id === state.id) return; // our own entry, echoed back after a reconnect
   let c = state.cameras.get(info.id);
   if (!c) {
     c = { index: state.camIndex++, objCount: 0, lastSeen: performance.now(), thumb: null };
@@ -229,6 +246,42 @@ function onCamera(info) {
   c.lastSeen = performance.now();
   cameraVis.upsert(c.info, c.matrix);
   renderCameraList();
+}
+
+/** Fast position update from a moving device (another headset or desktop viewer). */
+function onPose(m) {
+  const c = state.cameras.get(m.id);
+  if (!c || m.id === state.id) return;
+  c.info.pose = m.pose;
+  c.matrix = msgToPose(m.pose);
+  c.lastSeen = performance.now();
+  cameraVis.upsert(c.info, c.matrix);
+}
+
+/** Tells the room where this headset is, so phones can show it on their maps. */
+function announceSelf() {
+  if (!state.link) return;
+  const xr = renderer.xr.isPresenting;
+  state.link.send({
+    t: 'camera',
+    id: state.id,
+    name: xr ? 'Headset' : 'Viewer (desktop)',
+    color: HEADSET_COLOR,
+    kind: 'headset',
+    pose: state.selfPose ? poseToMsg(state.selfPose) : null,
+    fovH: headCam.on ? headCam.fov : 90,
+    aspect: 4 / 3,
+    detecting: headCam.on,
+    active: true,
+  });
+}
+setInterval(announceSelf, 4000);
+
+let lastPoseSent = 0;
+function sendSelfPose(now) {
+  if (!state.link || !state.selfPose || now - lastPoseSent < 1000 / POSE_HZ) return;
+  lastPoseSent = now;
+  state.link.send({ t: 'pose', id: state.id, pose: poseToMsg(state.selfPose) });
 }
 
 function removeCamera(id) {
@@ -247,7 +300,7 @@ function onThumb(m) {
 }
 
 function onObjects(msg) {
-  let c = state.cameras.get(msg.cam);
+  let c = msg.cam === state.id ? selfSource : state.cameras.get(msg.cam);
   if (!c) {
     // Objects before the camera's announcement: register it with defaults.
     onCamera({ id: msg.cam, name: msg.cam });
@@ -276,6 +329,7 @@ function onObjects(msg) {
       }
     }
     rec.lastUpdate = now;
+    rec.color = c.info.color;
     rec.conf = o.c ?? 0.5;
     rec.p = o.p;
     rec.visual.setTarget(o.p, o.s);
@@ -358,6 +412,7 @@ $('t-labels').onchange = (e) => (state.labels = e.target.checked);
 $('t-cams').onchange = (e) => (state.showCams = e.target.checked);
 $('t-markers').onchange = (e) => (state.showMarkers = e.target.checked);
 $('t-truth').onchange = (e) => (state.showTruth = e.target.checked);
+$('t-minimap').onchange = (e) => setMinimap(e.target.checked);
 $('connect').onclick = connect;
 $('room').addEventListener('keydown', (e) => e.key === 'Enter' && connect());
 $('hud-toggle').onclick = () => {
@@ -373,6 +428,152 @@ function toast(text, ms = 3500) {
   t.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+// ------------------------------------------------------------------ mini map (top left)
+
+const miniCanvas = $('minimap');
+const miniDesktop = new Minimap(miniCanvas, { follow: true, range: 6, title: 'Shared map' });
+function sizeMiniCanvas() {
+  const css = miniCanvas.getBoundingClientRect().width || 200;
+  const px = Math.round(css * Math.min(devicePixelRatio, 2));
+  if (miniCanvas.width !== px) miniCanvas.width = miniCanvas.height = px;
+}
+addEventListener('resize', sizeMiniCanvas);
+
+// In the headset the map is a small panel fixed to the top left of your view.
+const miniXRCanvas = document.createElement('canvas');
+miniXRCanvas.width = miniXRCanvas.height = 512;
+const miniXR = new Minimap(miniXRCanvas, { follow: true, range: 6, title: 'Shared map' });
+const miniXRTexture = new THREE.CanvasTexture(miniXRCanvas);
+miniXRTexture.colorSpace = THREE.SRGBColorSpace;
+const miniXRMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.13, 0.13),
+  new THREE.MeshBasicMaterial({ map: miniXRTexture, transparent: true, depthTest: false, depthWrite: false })
+);
+miniXRMesh.renderOrder = 2100;
+miniXRMesh.matrixAutoUpdate = false;
+miniXRMesh.visible = false;
+scene.add(miniXRMesh);
+// Head-relative placement: up and to the left, 0.6 m in front of the eyes.
+const MINI_XR_OFFSET = new THREE.Matrix4().makeTranslation(-0.2, 0.12, -0.6);
+
+/** Everything the mini map shows: devices, their detections and the markers. */
+function minimapData(now) {
+  const self = state.selfPose ? { ...floorPose(state.selfPose), kind: 'headset', color: HEADSET_COLOR, name: 'You' } : null;
+  const devices = [];
+  for (const c of state.cameras.values()) {
+    if (!c.matrix) continue;
+    devices.push({ ...floorPose(c.matrix), id: c.info.id, color: c.info.color, name: c.info.name, kind: c.info.kind === 'headset' ? 'headset' : 'camera', fovH: c.info.fovH, stale: (now - c.lastSeen) / 1000 > 6 });
+  }
+  const objects = [];
+  for (const o of state.objects.values()) {
+    if (o.dupOf || state.hiddenLabels.has(o.label) || (now - o.lastUpdate) / 1000 > FADE_START_S) continue;
+    objects.push({ p: [o.p[0], o.p[2]], label: o.label, color: o.color, mine: o.cam === state.id });
+  }
+  const markers = Object.entries(state.map?.markers || {}).map(([id, m]) => ({ id, p: [m.p[0], m.p[2]], yaw: m.yaw }));
+  return { self, devices, objects, markers, recording: headCam.on };
+}
+
+function setMinimap(on) {
+  state.showMinimap = on;
+  safeSet('seethrough.minimap', on ? 'on' : 'off');
+  $('t-minimap').checked = on;
+  miniCanvas.hidden = !on || renderer.xr.isPresenting;
+}
+
+// ------------------------------------------------------------------ headset camera
+//
+// With the headset camera on, the headset runs the same on-device detector as the
+// phones and shares what it detects. Frames are processed on the headset and never
+// sent anywhere. Needs a Quest Browser that lets web pages use the headset cameras.
+
+const headCam = {
+  on: false,
+  starting: false,
+  confirm: false, // first press asks the wearer to confirm, second press starts
+  fov: Number(qs('hfov', 80)), // approximate horizontal FOV of the Quest passthrough camera
+  status: '',
+  video: null,
+  stream: null,
+  detector: null,
+  K: null,
+  busy: false,
+  lastRun: 0,
+  tracker: new Tracker({ prefix: 'h' }),
+};
+
+async function startHeadsetCamera() {
+  if (headCam.on || headCam.starting) return;
+  if (!navigator.mediaDevices?.getUserMedia) {
+    headCam.status = 'This browser does not let web pages use the headset camera.';
+    return;
+  }
+  headCam.starting = true;
+  headCam.status = 'Starting headset camera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 960 } },
+      audio: false,
+    });
+    const video = document.createElement('video');
+    video.playsInline = true;
+    video.muted = true;
+    video.srcObject = stream;
+    await video.play();
+    await new Promise((r) => (video.videoWidth ? r() : video.addEventListener('loadedmetadata', r, { once: true })));
+    headCam.stream = stream;
+    headCam.video = video;
+    headCam.K = intrinsicsFromFov(video.videoWidth, video.videoHeight, headCam.fov);
+    if (!headCam.detector) {
+      const { CocoDetector } = await import('../node/detector.js');
+      headCam.detector = new CocoDetector();
+      await headCam.detector.load((t) => (headCam.status = t));
+    }
+    headCam.on = true;
+    headCam.status = `Headset camera on · ${video.videoWidth}×${video.videoHeight} · detecting on this headset`;
+    announceSelf();
+  } catch (e) {
+    stopHeadsetCamera();
+    headCam.status = `Headset camera unavailable: ${e.message || e}`;
+  } finally {
+    headCam.starting = false;
+  }
+}
+
+function stopHeadsetCamera() {
+  headCam.on = false;
+  headCam.confirm = false;
+  headCam.stream?.getTracks().forEach((t) => t.stop());
+  headCam.stream = null;
+  headCam.video = null;
+  if (headCam.status.startsWith('Headset camera on')) headCam.status = 'Headset camera off.';
+  announceSelf();
+}
+
+/** Runs one detection on the latest headset camera frame (called from the frame loop). */
+function runHeadsetDetection(now) {
+  if (!headCam.on || headCam.busy || !headCam.detector?.model || !state.selfPose) return;
+  if (now - headCam.lastRun < 1000 / SEND_HZ) return;
+  headCam.lastRun = now;
+  headCam.busy = true;
+  // Use the head pose from when the frame was taken, not when detection finishes.
+  const pose = state.selfPose.clone();
+  headCam.detector
+    .detect(headCam.video, 20, 0.5)
+    .then((dets) => {
+      const objs3d = [];
+      for (const d of dets) {
+        const w = detectionToWorld(d.bbox, headCam.K, pose, d.label);
+        if (w) objs3d.push({ label: d.label, p: w.p, s: w.s, c: d.score });
+      }
+      const objs = headCam.tracker.update(objs3d);
+      const msg = { t: 'objects', cam: state.id, ts: state.link.now(), objs };
+      state.link.send(msg);
+      onObjects(msg); // show our own detections too
+    })
+    .catch((e) => console.warn(e))
+    .finally(() => (headCam.busy = false));
 }
 
 // ------------------------------------------------------------------ simulator
@@ -527,6 +728,14 @@ function onPanelButton(id) {
   else if (id === 'prev') aligner.cycleMarker(-1);
   else if (id === 'next') aligner.cycleMarker(1);
   else if (id === 'hide') panel.mesh.visible = false;
+  else if (id === 'minimap') setMinimap(!state.showMinimap);
+  else if (id === 'headcam') {
+    if (headCam.on) stopHeadsetCamera();
+    else if (!headCam.confirm) {
+      headCam.confirm = true;
+      headCam.status = 'Only use the headset camera where people nearby know it is on. Press again to start.';
+    } else startHeadsetCamera();
+  }
   else if (id.startsWith('label:')) toggleLabel(id.slice(6));
 }
 
@@ -540,7 +749,20 @@ function panelModel() {
         { id: 'labels', label: 'Labels', on: state.labels },
         { id: 'cams', label: 'Cameras', on: state.showCams },
         { id: 'markers', label: 'Markers', on: state.showMarkers },
+        { id: 'minimap', label: 'Mini map', on: state.showMinimap },
         { id: 'hide', label: 'Hide' },
+      ],
+    },
+    {
+      heading: 'Share what this headset sees',
+      lines: [{ text: headCam.status || 'Off. Turn on to detect with the headset camera and share it with the phones.', color: headCam.on ? '#f87171' : '#8c9bb0' }],
+      buttons: [
+        {
+          id: 'headcam',
+          label: headCam.on ? '● Headset camera on' : headCam.starting ? 'Starting…' : headCam.confirm ? 'Confirm: start camera' : 'Headset camera',
+          on: headCam.on,
+          accent: '#f87171',
+        },
       ],
     },
   ];
@@ -577,7 +799,7 @@ function panelModel() {
   });
   return {
     title: 'SeeThrough',
-    subtitle: `${status} · ${state.objects.size} objects · ${lat}`,
+    subtitle: `${headCam.on ? '● CAMERA ON · ' : ''}${status} · ${state.objects.size} objects · ${lat}`,
     sections,
     footer: 'Squeeze to bring this panel in front of you. Trigger to press.',
   };
@@ -638,6 +860,7 @@ renderer.xr.addEventListener('sessionstart', () => {
   if (simHouse) simHouse.visible = false;
   $('hud').hidden = true;
   $('hint').hidden = true;
+  miniCanvas.hidden = true;
   const session = renderer.xr.getSession();
   restoreAnchor(session);
   setTimeout(placePanel, 300);
@@ -650,6 +873,10 @@ renderer.xr.addEventListener('sessionend', () => {
   if (simHouse && state.sim) simHouse.visible = true;
   $('hud').hidden = false;
   $('hint').hidden = false;
+  miniCanvas.hidden = !state.showMinimap;
+  miniXRMesh.visible = false;
+  stopHeadsetCamera();
+  state.selfPose = null;
   panel.mesh.visible = false;
   tipMarker.visible = false;
   anchor = null;
@@ -663,6 +890,8 @@ const viewerWorld = new THREE.Vector3();
 const invRoot = new THREE.Matrix4();
 let rateTimer = performance.now();
 let hudTimer = 0;
+let miniTimer = 0;
+const xrFromHead = new THREE.Matrix4();
 
 renderer.setAnimationLoop((t, frame) => {
   const dt = Math.min(clock.getDelta(), 0.1);
@@ -696,11 +925,26 @@ renderer.setAnimationLoop((t, frame) => {
     panel.setModel(panelModel());
     panel.draw();
     renderer.xr.getCamera().getWorldPosition(viewerWorld);
+
+    // Where the headset is in the shared world (only known once aligned to a marker).
+    const viewerPose = frame.getViewerPose(refSpace);
+    if (viewerPose) {
+      xrFromHead.fromArray(viewerPose.transform.matrix);
+      state.selfPose = aligner.xrFromWorld ? headWorldPose(aligner.xrFromWorld, xrFromHead) : null;
+      miniXRMesh.matrix.multiplyMatrices(xrFromHead, MINI_XR_OFFSET);
+      miniXRMesh.matrixWorldNeedsUpdate = true;
+      miniXRMesh.visible = state.showMinimap;
+    }
+    runHeadsetDetection(now);
   } else {
     if (viewMode === 'walk') updateWalk(dt);
     else orbit.update();
     viewerWorld.copy(camera.position);
+    // On the desktop the walk view stands in for the headset, so phones can see it.
+    camera.updateMatrixWorld();
+    state.selfPose = viewMode === 'walk' ? camera.matrixWorld.clone() : null;
   }
+  sendSelfPose(now);
   invRoot.copy(worldRoot.matrix).invert();
   viewerWorld.applyMatrix4(invRoot);
 
@@ -754,6 +998,18 @@ renderer.setAnimationLoop((t, frame) => {
     state.updates = 0;
     rateTimer = now;
   }
+  miniTimer += dt;
+  if (state.showMinimap && miniTimer > 1 / 15) {
+    miniTimer = 0;
+    const data = minimapData(now);
+    if (xr) {
+      miniXR.draw(data);
+      miniXRTexture.needsUpdate = true;
+    } else if (!miniCanvas.hidden) {
+      sizeMiniCanvas();
+      miniDesktop.draw(data);
+    }
+  }
   hudTimer += dt;
   if (hudTimer > 0.25 && !xr) {
     hudTimer = 0;
@@ -774,6 +1030,7 @@ renderer.setAnimationLoop((t, frame) => {
 $('room').value = state.room;
 $('relay').value = state.relay;
 setViewMode('walk');
+setMinimap(state.showMinimap);
 connect();
 if (qs('sim') === '1' || (!state.relay && qs('sim') !== '0')) {
   // With no relay the viewer has nothing to show, so run the simulator by default.

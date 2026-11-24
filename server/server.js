@@ -2,7 +2,8 @@
 //
 // - Serves the web apps (viewer, camera node, simulator, markers) from the repo root.
 // - Runs a WebSocket relay at /ws. Clients join a room with a code; object updates
-//   from camera nodes are forwarded to everyone else in the room.
+//   from any device (phones, Python nodes, the headset) are forwarded to everyone
+//   else in the room, so every device sees what the others detect.
 // - Keeps per-room state (marker map, camera list) and saves the marker map to disk
 //   so calibration only has to be done once.
 //
@@ -214,6 +215,14 @@ wss.on('connection', (ws, req) => {
         ws.cameraIds = ws.cameraIds || new Set();
         ws.cameraIds.add(msg.id);
         room.cameras.set(msg.id, msg);
+        room.broadcast(msg, ws);
+        break;
+      }
+      case 'pose': {
+        // A moving device (the headset): keep its stored entry fresh for late joiners.
+        if (typeof msg.id !== 'string' || !msg.pose) return;
+        const cam = room.cameras.get(msg.id);
+        if (cam) cam.pose = msg.pose;
         room.broadcast(msg, ws);
         break;
       }

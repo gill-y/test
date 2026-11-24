@@ -5,8 +5,9 @@ import * as THREE from 'three';
 import {
   intrinsicsFromFov, poseFromMarker, markerWorldMatrix, markerObjectPoints, cameraWorldFromMarker,
   detectionToWorld, estimateFocal, markerMatrixFromTwoPoints, markerFromMatrix, fovFromFocal,
-  averageCorners, markerPixelSize,
+  averageCorners, markerPixelSize, floorPose, headWorldPose, projectBox,
 } from '../js/common/geometry.js';
+import { worldToMap, computeView, headingFromForward } from '../js/common/minimap.js';
 import { Aligner } from '../js/viewer/alignment.js';
 import { Tracker } from '../js/common/tracker.js';
 
@@ -164,6 +165,36 @@ for (const [w, h, pos, limit] of [
     ids.push(out[0].id);
   }
   check('tracker keeps one id for a walking person', new Set(ids).size === 1, ids[0]);
+}
+
+// 7. Shared view: headset pose, mini map and projecting other devices' objects.
+{
+  // A headset aligned with some tracking offset, standing at (2, 1.6, 1) facing +X.
+  const xrFromWorld = new THREE.Matrix4().makeRotationY(0.7).setPosition(1, 0, -3);
+  const worldFromHeadTrue = new THREE.Matrix4().makeRotationY(-Math.PI / 2).setPosition(2, 1.6, 1);
+  const xrFromHead = xrFromWorld.clone().multiply(worldFromHeadTrue);
+  const head = headWorldPose(xrFromWorld, xrFromHead);
+  const fp = floorPose(head);
+  check('headset world pose from alignment', Math.hypot(fp.p[0] - 2, fp.p[1] - 1) < 1e-6 && Math.abs(fp.height - 1.6) < 1e-6 && Math.abs(fp.heading - Math.PI / 2) < 1e-6, `heading ${fp.heading.toFixed(3)}`);
+
+  // Follow-mode map: the direction you face is up, and a point to your right is to the right.
+  const view = computeView({ size: 200, follow: true, self: fp, points: [], range: 5 });
+  const ahead = worldToMap(3, 1, view); // 1 m in front (+X)
+  const right = worldToMap(2, 2, view); // facing +X, your right is +Z
+  check('mini map: ahead is up, right is right', Math.abs(ahead.x - 100) < 1e-6 && ahead.y < 100 && Math.abs(right.y - 100) < 1e-6 && right.x > 100);
+  check('heading convention', Math.abs(headingFromForward(0, -1)) < 1e-9 && Math.abs(headingFromForward(1, 0) - Math.PI / 2) < 1e-9);
+  const fit = computeView({ size: 200, follow: false, self: null, points: [[-4, -2], [6, 3]], range: 3 });
+  const a = worldToMap(-4, -2, fit);
+  const b = worldToMap(6, 3, fit);
+  check('mini map fit mode keeps every point on the map', [a, b].every((q) => q.x > 0 && q.x < 200 && q.y > 0 && q.y < 200));
+
+  // A person the headset sees, projected into a phone's picture, matches a direct projection.
+  const K = intrinsicsFromFov(1280, 720, 65);
+  const cam = makeCamera([0, 2.2, 3], [0, 0.8, -1], K);
+  const box = projectBox([0.3, 0.85, -0.5], [0.5, 1.7, 0.4], K, cam.matrixWorld);
+  const top = project(cam, K, new THREE.Vector3(0.3, 1.7, -0.5));
+  check('projects a shared object into a phone camera', !!box && top.y >= box.y - 1 && top.y <= box.y + box.h && top.x > box.x && top.x < box.x + box.w, box ? `${box.w.toFixed(0)}×${box.h.toFixed(0)} px` : 'null');
+  check('ignores shared objects behind the phone', projectBox([0, 0.85, 6], [0.5, 1.7, 0.4], K, cam.matrixWorld) === null);
 }
 
 console.log(failures ? `\n${failures} test(s) failed` : '\nAll tests passed');

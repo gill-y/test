@@ -5,9 +5,13 @@
 //   welcome    {t, id, room, serverTime, map, cameras[], thumbs[], peers[]}
 //   ping/pong  {t:'ping', c} -> {t:'pong', c, s}        (clock sync)
 //   camera     {t, id, name, color, kind, pose:{p:[x,y,z], q:[x,y,z,w]}|null, fovH, active}
+//              kind 'headset' is the headset itself: it is a device that detects too.
+//   pose       {t, id, pose:{p, q}}  fast position updates for a moving device (headset), ~10 Hz
 //   cameraGone {t, id}
 //   objects    {t, cam, ts, objs:[{id, label, p:[x,y,z], s:[w,h,d], c, kind}]}
 //              ts is in relay-clock milliseconds; p is the object's centre in world metres.
+//              Sent by phones, Python nodes and the headset alike; every device shows
+//              everyone else's detections (positions only, never video).
 //   thumb      {t, cam, img:'data:image/jpeg;base64,...'}
 //   map        {t, map:{markers:{[id]:{p:[x,y,z], yaw, size}}, anchor, updated}}
 //
@@ -18,6 +22,7 @@ export const PROTOCOL_VERSION = 1;
 export const DEFAULT_MARKER_SIZE = 0.15; // metres, black square edge to edge
 export const MARKER_DICTIONARY = 'ARUCO_MIP_36h12';
 export const SEND_HZ = 12;
+export const POSE_HZ = 10;
 export const FADE_START_S = 1.0;
 export const FADE_END_S = 2.5;
 
@@ -31,6 +36,9 @@ export const PALETTE = [
   '#4ade80', // mint
   '#f87171', // coral
 ];
+
+/** The headset's colour on every map and outline (phones use PALETTE colours). */
+export const HEADSET_COLOR = '#ffffff';
 
 export function colorForIndex(i) {
   return PALETTE[((i % PALETTE.length) + PALETTE.length) % PALETTE.length];

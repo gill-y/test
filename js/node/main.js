@@ -4,17 +4,22 @@
 //
 // Raw video stays on this device. Only object positions (and, if switched on, a
 // small preview thumbnail) are sent.
+//
+// The node also listens: it shows what the headset and the other phones detect,
+// on a mini map (top left of the video) and as dashed outlines on the video.
 
 import * as THREE from 'three';
 import { openLink } from '../common/transport.js';
 import {
   qs, randomId, randomRoomCode, normalizeRoom, defaultRelayUrl, safeGet, safeSet, safeGetJSON, safeSetJSON,
-  SEND_HZ, MARKER_DICTIONARY, colorForIndex, prettyLabel,
+  SEND_HZ, MARKER_DICTIONARY, colorForIndex, prettyLabel, FADE_END_S,
 } from '../common/protocol.js';
 import {
   intrinsicsFromFov, poseFromMarker, markerWorldMatrix, cameraWorldFromMarker, detectionToWorld,
   poseToMsg, msgToPose, estimateFocal, fovFromFocal, averageCorners, markerPixelSize,
+  floorPose, projectBox,
 } from '../common/geometry.js';
+import { Minimap } from '../common/minimap.js';
 import { Tracker } from '../common/tracker.js';
 import { CocoDetector } from './detector.js';
 
@@ -36,6 +41,8 @@ const st = {
   lastDets: [],
   lastMarkers: [],
   pendingObjs: null,
+  lastTracked: [], // this node's own objects in world coordinates
+  remote: { devices: new Map(), objects: new Map() }, // what the other devices report
   counters: { det: 0, sent: 0 },
   wakeLock: null,
 };
@@ -150,6 +157,9 @@ function stop() {
   st.stream = null;
   if (st.source?.kind === 'synthetic') st.source.el.remove();
   st.source = null;
+  st.lastTracked = [];
+  st.remote.devices.clear();
+  st.remote.objects.clear();
   if (st.link) {
     st.link.send({ t: 'cameraGone', id: st.id });
     st.link.close();
@@ -201,7 +211,90 @@ function connect() {
   });
   st.link.on('map', (m) => setMap(m.map));
   st.link.on('peer', (m) => m.joined && announce());
+  st.link.on('welcome', (m) => (m.cameras || []).forEach(onRemoteDevice));
+  st.link.on('camera', onRemoteDevice);
+  st.link.on('pose', onRemotePose);
+  st.link.on('cameraGone', (m) => st.remote.devices.delete(m.id));
+  st.link.on('objects', onRemoteObjects);
 }
+
+// ------------------------------------------------------------------ other devices
+
+function onRemoteDevice(info) {
+  if (!info?.id || info.id === st.id) return;
+  const d = st.remote.devices.get(info.id) || { index: st.remote.devices.size + 1 };
+  d.info = { ...info, color: info.color || colorForIndex(d.index) };
+  d.matrix = msgToPose(info.pose);
+  d.lastSeen = performance.now();
+  st.remote.devices.set(info.id, d);
+}
+
+function onRemotePose(m) {
+  const d = st.remote.devices.get(m.id);
+  if (!d) return;
+  d.info.pose = m.pose;
+  d.matrix = msgToPose(m.pose);
+  d.lastSeen = performance.now();
+}
+
+function onRemoteObjects(msg) {
+  if (msg.cam === st.id) return;
+  if (!st.remote.devices.has(msg.cam)) onRemoteDevice({ id: msg.cam, name: msg.cam });
+  const d = st.remote.devices.get(msg.cam);
+  d.lastSeen = performance.now();
+  const now = performance.now();
+  for (const o of msg.objs || []) {
+    st.remote.objects.set(`${msg.cam}:${o.id}`, { ...o, cam: msg.cam, color: d.info.color, from: d.info.name || 'another device', at: now });
+  }
+}
+
+/** Other devices' objects that are still fresh and that this node isn't already seeing itself. */
+function remoteObjects() {
+  const now = performance.now();
+  const out = [];
+  for (const [k, o] of st.remote.objects) {
+    if ((now - o.at) / 1000 > FADE_END_S) {
+      st.remote.objects.delete(k);
+      continue;
+    }
+    if ((now - o.at) / 1000 > 1) continue;
+    const mine = st.lastTracked.some((m) => m.label === o.label && Math.hypot(m.p[0] - o.p[0], m.p[2] - o.p[2]) < 0.7);
+    if (!mine) out.push(o);
+  }
+  return out;
+}
+
+const minimap = new Minimap($('minimap'), { follow: false, range: 3, title: 'Shared map' });
+
+function drawMinimap() {
+  const canvas = $('minimap');
+  canvas.hidden = !st.running || !$('show-map').checked;
+  if (canvas.hidden) return;
+  const css = canvas.getBoundingClientRect().width || 200;
+  const px = Math.round(css * Math.min(devicePixelRatio, 2));
+  if (canvas.width !== px) canvas.width = canvas.height = px;
+  const now = performance.now();
+  const self = st.pose ? { ...floorPose(st.pose), kind: 'camera', color, name: 'You', fovH: Number($('fov').value) } : null;
+  const devices = [];
+  for (const d of st.remote.devices.values()) {
+    if (!d.matrix) continue;
+    devices.push({ ...floorPose(d.matrix), id: d.info.id, color: d.info.color, name: d.info.name, kind: d.info.kind === 'headset' ? 'headset' : 'camera', fovH: d.info.fovH, stale: (now - d.lastSeen) / 1000 > 6 });
+  }
+  const objects = [
+    ...st.lastTracked.map((o) => ({ p: [o.p[0], o.p[2]], label: o.label, color, mine: true })),
+    ...remoteObjects().map((o) => ({ p: [o.p[0], o.p[2]], label: o.label, color: o.color, mine: false })),
+  ];
+  const markers = Object.entries(st.map?.markers || {}).map(([id, m]) => ({ id, p: [m.p[0], m.p[2]], yaw: m.yaw }));
+  minimap.draw({ self, devices, objects, markers, recording: st.running });
+}
+setInterval(drawMinimap, 100);
+$('show-map').onchange = () => {
+  safeSet('seethrough.nodeMap', $('show-map').checked ? 'on' : 'off');
+  drawMinimap();
+};
+$('show-map').checked = safeGet('seethrough.nodeMap') !== 'off';
+$('show-remote').checked = safeGet('seethrough.nodeRemote') !== 'off';
+$('show-remote').onchange = () => safeSet('seethrough.nodeRemote', $('show-remote').checked ? 'on' : 'off');
 
 function setStatus(status) {
   $('status-pill').className = `pill ${status === 'open' ? 'ok' : status === 'connecting' ? 'warn' : 'bad'}`;
@@ -501,7 +594,10 @@ async function detectObjects() {
   else return;
   st.counters.det++;
   st.lastDets = dets;
-  if (!st.pose || !st.K) return;
+  if (!st.pose || !st.K) {
+    st.lastTracked = [];
+    return;
+  }
   const objs3d = [];
   for (const d of dets) {
     const w = detectionToWorld(d.bbox, st.K, st.pose, d.label);
@@ -509,6 +605,7 @@ async function detectObjects() {
     if (w) objs3d.push({ label: d.label, p: w.p, s: w.s, c: d.score });
   }
   st.pendingObjs = st.tracker.update(objs3d);
+  st.lastTracked = st.pendingObjs;
 }
 
 function sendThumb() {
@@ -535,6 +632,25 @@ function drawOverlay() {
     g.fillRect(d.bbox.x, d.bbox.y - 30 * Math.max(s, 0.6), tw, 28 * Math.max(s, 0.6));
     g.fillStyle = '#fff';
     g.fillText(text, d.bbox.x + 6, d.bbox.y - 9 * Math.max(s, 0.6));
+  }
+  // What the headset and the other phones detect, where it would be in this camera's picture.
+  // Dashed, so it's clear this device didn't detect it itself (it may be behind a wall).
+  if ($('show-remote').checked && st.pose && st.K) {
+    const camFromWorld = st.pose.clone().invert();
+    g.setLineDash([10 * Math.max(s, 0.6), 7 * Math.max(s, 0.6)]);
+    for (const o of remoteObjects()) {
+      const b = projectBox(o.p, o.s, st.K, st.pose, camFromWorld);
+      if (!b) continue;
+      g.strokeStyle = o.color;
+      g.strokeRect(b.x, b.y, b.w, b.h);
+      const text = `${prettyLabel(o.label)} · from ${o.from}`;
+      const tw = g.measureText(text).width + 12;
+      g.fillStyle = 'rgba(0,0,0,0.6)';
+      g.fillRect(b.x, b.y + b.h, tw, 28 * Math.max(s, 0.6));
+      g.fillStyle = o.color;
+      g.fillText(text, b.x + 6, b.y + b.h + 20 * Math.max(s, 0.6));
+    }
+    g.setLineDash([]);
   }
   for (const m of st.lastMarkers) {
     g.strokeStyle = '#ffd23f';
