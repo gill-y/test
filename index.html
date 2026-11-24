@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>test</title>
+  <style>
+    :root { --bg: #0f1115; --fg: #e8e8ea; --muted: #9a9ca3; --accent: #7aa2ff; }
+    @media (prefers-color-scheme: light) { :root { --bg: #fafafa; --fg: #16181d; --muted: #5b5e66; --accent: #2f5bd3; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+           background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+    main { max-width: 560px; }
+    h1 { margin: 0 0 8px; font-size: 2rem; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>It's live.</h1>
+    <p>This page is served by GitHub Pages from <a href="https://github.com/gill-y/test">gill-y/test</a>.</p>
+    <p>Edit <code>index.html</code>, push to <code>main</code>, and it updates here in about a minute.</p>
+  </main>
+</body>
+</html>
