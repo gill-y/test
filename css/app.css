@@ -213,6 +213,27 @@ label.field { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
 }
 .minimap[hidden] { display: none; }
 
+/* Simulator: what a phone's camera page would show. */
+.phone-view {
+  position: absolute;
+  left: 12px;
+  bottom: 52px;
+  width: min(380px, calc(100% - 24px));
+  z-index: 5;
+  background: var(--panel);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px;
+  display: grid;
+  gap: 6px;
+}
+.phone-view[hidden] { display: none; }
+.phone-view .pv-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+.phone-view select { font-size: 12px; padding: 3px 6px; min-width: 0; }
+.phone-view canvas { width: 100%; height: auto; display: block; border-radius: 8px; border: 1px solid var(--line); }
+
 .hint {
   position: absolute;
   left: 12px;
@@ -261,4 +282,5 @@ label.field { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
   .hud.collapsed > :not(header) { display: none; }
   .hud-toggle { display: inline-flex; }
   .hint { display: none; }
+  .phone-view { bottom: 72px; }
 }

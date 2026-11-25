@@ -64,6 +64,7 @@
         <label class="switch">Camera positions <input type="checkbox" id="t-cams" checked></label>
         <label class="switch">Mini map <input type="checkbox" id="t-minimap" checked></label>
         <label class="switch" id="truth-row" hidden>Ground truth (simulator) <input type="checkbox" id="t-truth"></label>
+        <label class="switch" id="pv-row" hidden>Phone view (simulator) <input type="checkbox" id="t-pv" checked></label>
       </section>
 
       <section aria-labelledby="h-filter">
@@ -78,6 +79,13 @@
     </aside>
 
     <canvas class="minimap" id="minimap" width="400" height="400" role="img" aria-label="Mini map: you, the phones, and everything they detect, seen from above"></canvas>
+    <section class="phone-view" id="phone-view" hidden aria-label="Simulated phone view">
+      <div class="pv-head">
+        <span>What this phone shows</span>
+        <select id="pv-cam" aria-label="Phone to show"></select>
+      </div>
+      <canvas id="pv-canvas" width="640" height="360" role="img" aria-label="The phone's picture: its own detections as solid boxes, other devices' detections as dashed outlines, and the shared mini map"></canvas>
+    </section>
     <div class="xr-slot" id="xr-slot"></div>
     <div class="hint" id="hint">Walk: <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> · drag to look</div>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>

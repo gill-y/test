@@ -61,6 +61,16 @@ export const SIM_OBJECTS = [
   { label: 'couch', size: [1.9, 0.85, 0.9], speed: 0, path: [[2.7, -4.5]] },
 ];
 
+// The simulated headset wearer's walk: living room -> kitchen -> bedroom and back,
+// through the doors (living/kitchen door at x -3.6..-2.8, kitchen/bedroom at z -4.4..-3.6).
+export const SIM_HEADSET_WALK = {
+  label: 'person',
+  size: [0.45, 1.71, 0.3],
+  speed: 0.8,
+  // Starts at the kitchen door so the demo shows the headset's detections right away.
+  path: [[-3.2, 1.0], [-3.2, -1.0], [-1.5, -2.0], [-0.5, -4.0], [0.4, -4.0], [1.6, -4.0], [2.8, -3.2], [2.5, -1.5], [1.6, -4.0], [0.4, -4.0], [-2.5, -3.5], [-3.2, -1.0], [-3.2, 1.0], [0.0, 2.5], [2.5, 3.5], [-2.0, 3.0]],
+};
+
 export function roomAt(x, z) {
   return ROOMS.find((r) => x >= r.x[0] && x <= r.x[1] && z >= r.z[0] && z <= r.z[1]) || null;
 }
