@@ -1,11 +1,11 @@
 // SeeThrough relay server.
 //
-// - Serves the web apps (viewer, camera node, simulator, markers) from the repo root.
+// - Serves the web apps (viewer, camera node, simulator) from the repo root.
 // - Runs a WebSocket relay at /ws. Clients join a room with a code; object updates
 //   from any device (phones, Python nodes, the headset) are forwarded to everyone
 //   else in the room, so every device sees what the others detect.
-// - Keeps per-room state (marker map, camera list) and saves the marker map to disk
-//   so calibration only has to be done once.
+// - Keeps per-room state (the map's id, camera list) and saves the map to disk, so
+//   cameras calibrated against it stay valid across relay restarts.
 //
 // HTTPS is used automatically when server/certs/key.pem + cert.pem exist
 // (run `npm run cert` to make a self-signed pair). WebXR on Quest needs HTTPS.
@@ -233,11 +233,11 @@ wss.on('connection', (ws, req) => {
         break;
       }
       case 'map': {
-        if (!msg.map || typeof msg.map !== 'object') return;
+        if (!msg.map || typeof msg.map !== 'object' || typeof msg.map.worldId !== 'string') return;
         room.map = { ...msg.map, updated: Date.now() };
         room.saveMap();
         room.broadcast({ t: 'map', map: room.map }, ws);
-        log(`map updated in ${room.code}: ${Object.keys(room.map.markers || {}).length} markers`);
+        log(`map ${room.map.worldId || '(none)'} in ${room.code}`);
         break;
       }
       case 'clearMap': {

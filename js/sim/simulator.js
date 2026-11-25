@@ -1,8 +1,9 @@
 // Simulator mode: fake camera nodes watching fake objects in a fake house.
 //
 // It is not a shortcut around the real pipeline. Each simulated camera:
-//   1. "Calibrates" by projecting a real map marker into its image (with pixel
-//      noise) and running the same marker-pose code a phone node runs.
+//   1. Calibrates the way a real phone does, with no markers: a simulated headset
+//      wearer walks around its room, the camera sees noisy person boxes, the
+//      "headset" reports its position, and the same WalkCalibrator solves the pose.
 //   2. Each frame, projects the true objects into its image to get 2D boxes,
 //      adds noise and dropouts, and then converts those boxes back to 3D with the
 //      same floor-projection code, using its *estimated* pose.
@@ -11,17 +12,8 @@
 
 import * as THREE from 'three';
 import { ROOMS, SIM_CAMERAS, SIM_MAP, SIM_OBJECTS, roomAt } from './world.js';
-import {
-  intrinsicsFromFov,
-  poseFromMarker,
-  markerWorldMatrix,
-  markerObjectPoints,
-  cameraWorldFromMarker,
-  averageCorners,
-  detectionToWorld,
-  poseToMsg,
-  verticalFov,
-} from '../common/geometry.js';
+import { intrinsicsFromFov, detectionToWorld, poseToMsg, verticalFov } from '../common/geometry.js';
+import { WalkCalibrator, HEAD_TOP_ABOVE_EYES } from '../common/walkcal.js';
 import { Tracker } from '../common/tracker.js';
 import { SEND_HZ, colorForIndex } from '../common/protocol.js';
 
@@ -68,7 +60,7 @@ class Mover {
 }
 
 class SimCamera {
-  constructor(def, index, link, map) {
+  constructor(def, index, link) {
     this.def = def;
     this.id = def.id;
     this.color = colorForIndex(index);
@@ -79,60 +71,105 @@ class SimCamera {
     this.cam.lookAt(...def.target);
     this.cam.updateMatrixWorld(true);
     this.tracker = new Tracker({ prefix: `${def.id}-` });
-    this.calibrate(map);
+    this.calibrate();
   }
 
-  /** Estimates this camera's world pose from noisy views of a marker. */
-  calibrate(map) {
-    const markers = map?.markers || {};
-    let best = null;
-    for (const [id, m] of Object.entries(markers)) {
-      const corners = this.projectMarker(m);
-      if (!corners) continue;
-      const area = Math.abs(
-        (corners[1].x - corners[0].x) * (corners[3].y - corners[0].y) - (corners[3].x - corners[0].x) * (corners[1].y - corners[0].y)
-      );
-      if (area > 200 && (!best || area > best.area)) best = { id, m, area };
-    }
-    this.calibratedWith = null;
-    if (best) {
-      // Same procedure as a real node: average 30 noisy corner detections, then solve.
-      const frames = [];
-      for (let i = 0; i < 30; i++) {
-        frames.push(this.projectMarker(best.m).map((c) => ({ x: c.x + gauss() * 0.5, y: c.y + gauss() * 0.5 })));
-      }
-      const pose = poseFromMarker(averageCorners(frames), best.m.size, this.K);
-      if (pose) {
-        this.estPose = cameraWorldFromMarker(markerWorldMatrix(best.m), pose.glCamFromMarker);
-        this.calibratedWith = best.id;
+  /**
+   * Walk calibration, as on a real phone: a simulated headset wearer walks around this
+   * camera's room; the camera sees noisy person boxes and the headset reports its
+   * position (1 cm noise). The camera starts from a 65° FOV guess, like a phone.
+   */
+  calibrate() {
+    const room = ROOMS.find((r) => r.id === this.def.room);
+    const cal = new WalkCalibrator(intrinsicsFromFov(this.def.w, this.def.h, 65), { minSeconds: 0 });
+    const eye = 1.6;
+    // Start somewhere in the room that is in front of the camera and not right under it.
+    let x = (room.x[0] + room.x[1]) / 2;
+    let z = (room.z[0] + room.z[1]) / 2;
+    for (let k = 0; k < 200; k++) {
+      const tx = room.x[0] + 0.5 + Math.random() * (room.x[1] - room.x[0] - 1);
+      const tz = room.z[0] + 0.5 + Math.random() * (room.z[1] - room.z[0] - 1);
+      if (Math.hypot(tx - this.def.pos[0], tz - this.def.pos[2]) > 1.6 && this.personBox(tx, tz, eye, 0)) {
+        x = tx;
+        z = tz;
+        break;
       }
     }
-    if (!this.estPose) {
-      // No marker in view: pretend the camera was linked through setup mode, with a
-      // little error, so the demo still runs.
+    let heading = Math.random() * Math.PI * 2;
+    for (let i = 0; i < 3000 && !cal.progress().ready; i++) {
+      // A meandering walk that stays 0.4 m away from the walls.
+      heading += (Math.random() - 0.5) * 0.6;
+      const nx = x + Math.sin(heading) * 0.08;
+      const nz = z + Math.cos(heading) * 0.08;
+      // Stay 0.4 m from the walls and, like a person walking in front of a camera, at least 1.3 m from it.
+      const tooClose = Math.hypot(nx - this.def.pos[0], nz - this.def.pos[2]) < 1.3;
+      if (tooClose || nx < room.x[0] + 0.4 || nx > room.x[1] - 0.4 || nz < room.z[0] + 0.4 || nz > room.z[1] - 0.4) {
+        heading += Math.PI / 2;
+        continue;
+      }
+      x = nx;
+      z = nz;
+      const bbox = this.personBox(x, z, eye, heading);
+      if (bbox) cal.add(bbox, [x + gauss() * 0.01, eye + gauss() * 0.01, z + gauss() * 0.01]);
+    }
+    const res = cal.solve();
+    this.calibFrames = cal.frames;
+    this.calibrated = !!res?.ok;
+    if (res?.ok) {
+      this.estPose = res.worldFromCam;
+      this.estFov = res.fovH;
+      this.estK = intrinsicsFromFov(this.def.w, this.def.h, res.fovH);
+    } else {
+      // Couldn't calibrate (shouldn't happen): fall back to a slightly wrong pose so the demo still runs.
       const noisy = this.cam.matrixWorld.clone();
       noisy.multiply(new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(0.6)));
       noisy.setPosition(new THREE.Vector3().setFromMatrixPosition(noisy).add(new THREE.Vector3(0.03, -0.02, 0.04)));
       this.estPose = noisy;
+      this.estFov = this.def.fov;
+      this.estK = this.K;
+      console.warn(`${this.def.name}: walk calibration failed`, res);
     }
     const truePos = new THREE.Vector3().setFromMatrixPosition(this.cam.matrixWorld);
     const estPos = new THREE.Vector3().setFromMatrixPosition(this.estPose);
     this.calibError = truePos.distanceTo(estPos);
   }
 
-  projectMarker(m) {
-    const W = markerWorldMatrix(m);
-    const camPos = new THREE.Vector3().setFromMatrixPosition(this.cam.matrixWorld);
-    const markerPos = new THREE.Vector3().setFromMatrixPosition(W);
-    const normal = new THREE.Vector3().setFromMatrixColumn(W, 2);
-    if (normal.dot(camPos.clone().sub(markerPos)) <= 0) return null; // seen from behind
-    const out = [];
-    for (const [x, y] of markerObjectPoints(m.size)) {
-      const p = this.projectPoint(new THREE.Vector3(x, y, 0).applyMatrix4(W));
-      if (!p || p.x < 0 || p.y < 0 || p.x > this.K.w || p.y > this.K.h) return null;
-      out.push(p);
+  /**
+   * The box a person detector would draw around someone standing at (x, z) with their
+   * eyes at `eye`, walking towards `heading`: a round head, shoulders and hips facing
+   * the camera, and two feet a stride apart. Null when they're not fully in view.
+   */
+  personBox(x, z, eye, heading) {
+    const camPos = this.def.pos;
+    const toCam = new THREE.Vector3(camPos[0] - x, 0, camPos[2] - z).normalize();
+    const side = new THREE.Vector3(-toCam.z, 0, toCam.x);
+    const walk = new THREE.Vector3(Math.sin(heading), 0, Math.cos(heading));
+    const headC = new THREE.Vector3(x, eye + HEAD_TOP_ABOVE_EYES - 0.1, z);
+    const pts = [];
+    for (let a = 0; a < 12; a++) {
+      const ang = (a / 12) * Math.PI * 2;
+      for (const el of [0, 0.7, 1.2, Math.PI / 2]) {
+        pts.push(headC.clone().add(new THREE.Vector3(Math.cos(ang) * Math.cos(el) * 0.1, Math.sin(el) * 0.1, Math.sin(ang) * Math.cos(el) * 0.1)));
+      }
     }
-    return out;
+    for (const [h, half, depth] of [[eye - 0.2, 0.22, 0.12], [0.95, 0.18, 0.12], [0.5, 0.14, 0.1]]) {
+      for (const sgn of [-1, 1]) for (const d of [-1, 1]) pts.push(new THREE.Vector3(x, h, z).addScaledVector(side, sgn * half).addScaledVector(toCam, d * depth));
+    }
+    for (const stride of [-0.18, 0.18]) for (const toe of [-0.12, 0.12]) for (const lat of [-0.06, 0.06]) {
+      pts.push(new THREE.Vector3(x, 0, z).addScaledVector(walk, stride + toe).addScaledVector(side, lat));
+    }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      const q = this.projectPoint(p);
+      if (!q) return null;
+      minX = Math.min(minX, q.x);
+      maxX = Math.max(maxX, q.x);
+      minY = Math.min(minY, q.y);
+      maxY = Math.max(maxY, q.y);
+    }
+    if (minX < 0 || maxX > this.K.w || minY < 0 || maxY > this.K.h) return null;
+    const n = 3;
+    return { x: minX + gauss() * n, y: minY + gauss() * n, w: maxX - minX + gauss() * n, h: maxY - minY + gauss() * n };
   }
 
   projectPoint(world) {
@@ -142,12 +179,12 @@ class SimCamera {
   }
 
   /** 2D detections this camera would produce for the current true object positions. */
-  detect(movers) {
+  detect(movers, missRate = 0.04) {
     const dets = [];
     for (const o of movers) {
       const r = roomAt(o.pos.x, o.pos.z);
       if (!r || r.id !== this.def.room) continue;
-      if (Math.random() < 0.04) continue; // missed detection
+      if (Math.random() < missRate) continue; // missed detection
       let minX = Infinity;
       let minY = Infinity;
       let maxX = -Infinity;
@@ -190,7 +227,7 @@ class SimCamera {
     this.last2d = dets2d;
     const dets3d = [];
     for (const d of dets2d) {
-      const w = detectionToWorld(d.bbox, this.K, this.estPose, d.label);
+      const w = detectionToWorld(d.bbox, this.estK, this.estPose, d.label);
       if (w) dets3d.push({ label: d.label, p: w.p, s: w.s, c: d.score });
     }
     const objs = this.tracker.update(dets3d, now);
@@ -205,9 +242,8 @@ class SimCamera {
       color: this.color,
       kind: 'simulated',
       pose: poseToMsg(this.estPose),
-      fovH: this.def.fov,
+      fovH: this.estFov,
       aspect: this.def.w / this.def.h,
-      calibratedWith: this.calibratedWith,
       active: true,
     });
   }
@@ -257,10 +293,9 @@ export class Simulator {
   start() {
     if (this.running) return;
     this.running = true;
-    // The simulated house always uses its own marker map, so the fake cameras line up
-    // with the fake walls. A real headset joining the room aligns to marker 0.
+    // The simulated house is its own map (its frame is the "headset" frame).
     if (this.publishMap) this.link.send({ t: 'map', map: SIM_MAP });
-    this.cameras = SIM_CAMERAS.map((d, i) => new SimCamera(d, i, this.link, SIM_MAP));
+    this.cameras = SIM_CAMERAS.map((d, i) => new SimCamera(d, i, this.link));
     for (const c of this.cameras) c.announce();
     this._offPeer = this.link.on('peer', (m) => {
       if (m.joined) {
@@ -299,7 +334,7 @@ export class Simulator {
 
   /** Calibration error per camera, for display. */
   stats() {
-    return this.cameras.map((c) => ({ id: c.id, name: c.def.name, calibratedWith: c.calibratedWith, errorM: c.calibError }));
+    return this.cameras.map((c) => ({ id: c.id, name: c.def.name, errorM: c.calibError, fov: c.estFov, calibrated: c.calibrated }));
   }
 
   /** True object positions (ground truth), for the desktop view's debug overlay. */

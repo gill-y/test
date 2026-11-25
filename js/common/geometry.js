@@ -4,12 +4,8 @@
 //   Image pixels:   OpenCV style, origin top-left, +x right, +y down.
 //   CV camera:      +X right, +Y down, +Z forward (into the scene).
 //   GL camera:      +X right, +Y up,   -Z forward (three.js camera convention).
-//   Marker frame:   origin at the marker centre, +X right, +Y up (as printed),
-//                   +Z out of the paper towards whoever is looking at it.
-//   World frame:    metres, +Y up, floor at y = 0 (see protocol.js).
-//
-// Marker corners come from the detector in the order top-left, top-right,
-// bottom-right, bottom-left (same order in js-aruco2 and OpenCV; verified).
+//   World frame:    metres, +Y up, floor at y = 0: the headset's floor-level tracking
+//                   space when it started the map (see protocol.js).
 
 import * as THREE from 'three';
 
@@ -52,37 +48,11 @@ function solveLinear(A, b) {
   return M.map((row, i) => row[n] / row[i]);
 }
 
-/** Homography H (row-major 3x3) mapping src[i] -> dst[i] for exactly four points. */
-export function homography4(src, dst) {
-  const A = [];
-  const b = [];
-  for (let i = 0; i < 4; i++) {
-    const [X, Y] = src[i];
-    const [x, y] = dst[i];
-    A.push([X, Y, 1, 0, 0, 0, -x * X, -x * Y]);
-    b.push(x);
-    A.push([0, 0, 0, X, Y, 1, -y * X, -y * Y]);
-    b.push(y);
-  }
-  const h = solveLinear(A, b);
-  if (!h) return null;
-  return [
-    [h[0], h[1], h[2]],
-    [h[3], h[4], h[5]],
-    [h[6], h[7], 1],
-  ];
-}
-
-const norm3 = (v) => Math.hypot(v[0], v[1], v[2]);
-const scale3 = (v, s) => [v[0] * s, v[1] * s, v[2] * s];
-const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-
+/** Rotation matrix from a rotation vector (axis * angle). */
 function rodrigues(rv) {
-  const th = norm3(rv);
+  const th = Math.hypot(rv[0], rv[1], rv[2]);
   if (th < 1e-12) return [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-  const [x, y, z] = scale3(rv, 1 / th);
+  const [x, y, z] = [rv[0] / th, rv[1] / th, rv[2] / th];
   const c = Math.cos(th);
   const s = Math.sin(th);
   const C = 1 - c;
@@ -109,290 +79,7 @@ function rotToRodrigues(R) {
   return [(R[2][1] - R[1][2]) * k, (R[0][2] - R[2][0]) * k, (R[1][0] - R[0][1]) * k];
 }
 
-function matVec(R, v) {
-  return [dot3(R[0], v), dot3(R[1], v), dot3(R[2], v)];
-}
-
-// ------------------------------------------------------------------ marker pose
-
-/** Marker corner coordinates in the marker frame: TL, TR, BR, BL (metres). */
-export function markerObjectPoints(size) {
-  const s = size / 2;
-  return [
-    [-s, s],
-    [s, s],
-    [s, -s],
-    [-s, -s],
-  ];
-}
-
-function projectCV(R, t, P, K) {
-  const X = [
-    R[0][0] * P[0] + R[0][1] * P[1] + t[0],
-    R[1][0] * P[0] + R[1][1] * P[1] + t[1],
-    R[2][0] * P[0] + R[2][1] * P[1] + t[2],
-  ];
-  return [K.cx + (K.f * X[0]) / X[2], K.cy + (K.f * X[1]) / X[2]];
-}
-
-function reprojectionError(R, t, obj, img, K) {
-  let e = 0;
-  for (let i = 0; i < 4; i++) {
-    const p = projectCV(R, t, obj[i], K);
-    e += Math.hypot(p[0] - img[i][0], p[1] - img[i][1]);
-  }
-  return e / 4;
-}
-
-/**
- * Pose of a square marker relative to the camera.
- * corners: four {x, y} pixel points (TL, TR, BR, BL). size: marker edge in metres.
- * Returns { glCamFromMarker: Matrix4, error: mean reprojection error in px, distance } or null.
- */
-export function poseFromMarker(corners, size, K) {
-  const obj = markerObjectPoints(size);
-  const img = corners.map((c) => [c.x, c.y]);
-  const norm = img.map(([u, v]) => [(u - K.cx) / K.f, (v - K.cy) / K.f]);
-  const H = homography4(obj, norm);
-  if (!H) return null;
-
-  // H ~ [r1 r2 t]
-  let h1 = [H[0][0], H[1][0], H[2][0]];
-  let h2 = [H[0][1], H[1][1], H[2][1]];
-  let h3 = [H[0][2], H[1][2], H[2][2]];
-  const lambda = 2 / (norm3(h1) + norm3(h2));
-  let r1 = scale3(h1, lambda);
-  let r2 = scale3(h2, lambda);
-  let t = scale3(h3, lambda);
-  if (t[2] < 0) {
-    r1 = scale3(r1, -1);
-    r2 = scale3(r2, -1);
-    t = scale3(t, -1);
-  }
-  // Orthonormalise symmetrically so neither axis is favoured.
-  const a = scale3(r1, 1 / norm3(r1));
-  const b = scale3(r2, 1 / norm3(r2));
-  const bis = scale3([a[0] + b[0], a[1] + b[1], a[2] + b[2]], 1);
-  const z = cross3(a, b);
-  const zn = scale3(z, 1 / norm3(z));
-  const bisn = scale3(bis, 1 / norm3(bis));
-  const perp = cross3(zn, bisn);
-  const s2 = Math.SQRT1_2;
-  const x = [s2 * (bisn[0] - perp[0]), s2 * (bisn[1] - perp[1]), s2 * (bisn[2] - perp[2])];
-  const y = [s2 * (bisn[0] + perp[0]), s2 * (bisn[1] + perp[1]), s2 * (bisn[2] + perp[2])];
-  const R0 = [
-    [x[0], y[0], zn[0]],
-    [x[1], y[1], zn[1]],
-    [x[2], y[2], zn[2]],
-  ];
-
-  // A square seen small or nearly head-on has two poses that fit the corners almost
-  // equally well (the marker tilted towards or away from the camera). Start the
-  // refinement from both and keep the one that reprojects better.
-  const v = scale3(t, 1 / norm3(t));
-  const n = zn;
-  const nm = sub3(scale3(v, 2 * dot3(n, v)), n); // normal mirrored about the line of sight
-  const axis = cross3(n, nm);
-  const sinA = norm3(axis);
-  const ang = Math.atan2(sinA, dot3(n, nm));
-  const starts = [R0];
-  if (sinA > 1e-9) {
-    const Q = rodrigues(scale3(axis, ang / sinA));
-    starts.push([0, 1, 2].map((r) => [0, 1, 2].map((c) => Q[r][0] * R0[0][c] + Q[r][1] * R0[1][c] + Q[r][2] * R0[2][c])));
-  }
-  let best = null;
-  for (const Rs of starts) {
-    const sol = refinePose(Rs, t, obj, img, K);
-    if (sol && sol.t[2] > 0 && (!best || sol.err < best.err)) best = sol;
-  }
-  if (!best) return null;
-  const R = best.R;
-  t = best.t;
-  const error = reprojectionError(R, t, obj, img, K);
-  const cvCamFromMarker = new THREE.Matrix4().set(
-    R[0][0], R[0][1], R[0][2], t[0],
-    R[1][0], R[1][1], R[1][2], t[1],
-    R[2][0], R[2][1], R[2][2], t[2],
-    0, 0, 0, 1
-  );
-  const glCamFromMarker = CV_TO_GL.clone().multiply(cvCamFromMarker);
-  return { glCamFromMarker, error, distance: norm3(t) };
-}
-
-/** Levenberg-Marquardt refinement of a marker pose on the corner reprojection error. */
-function refinePose(R, t, obj, img, K) {
-  let params = [...rotToRodrigues(R), ...t];
-  const residuals = (p) => {
-    const Rp = rodrigues(p.slice(0, 3));
-    const tp = p.slice(3);
-    const r = [];
-    for (let i = 0; i < 4; i++) {
-      const q = projectCV(Rp, tp, obj[i], K);
-      r.push(q[0] - img[i][0], q[1] - img[i][1]);
-    }
-    return r;
-  };
-  let mu = 1e-3;
-  for (let iter = 0; iter < 30; iter++) {
-    const r0 = residuals(params);
-    const J = r0.map(() => new Array(6).fill(0));
-    for (let j = 0; j < 6; j++) {
-      const d = j < 3 ? 1e-6 : 1e-6 * Math.max(1, Math.abs(params[j]));
-      const p2 = params.slice();
-      p2[j] += d;
-      const r2 = residuals(p2);
-      for (let i = 0; i < r0.length; i++) J[i][j] = (r2[i] - r0[i]) / d;
-    }
-    // Normal equations with a little damping (Levenberg-Marquardt style).
-    const JTJ = Array.from({ length: 6 }, () => new Array(6).fill(0));
-    const JTr = new Array(6).fill(0);
-    for (let i = 0; i < r0.length; i++) {
-      for (let a2 = 0; a2 < 6; a2++) {
-        JTr[a2] += J[i][a2] * r0[i];
-        for (let b2 = 0; b2 < 6; b2++) JTJ[a2][b2] += J[i][a2] * J[i][b2];
-      }
-    }
-    const e0 = r0.reduce((s, v) => s + v * v, 0);
-    const A = JTJ.map((row, k) => row.map((val, j) => (j === k ? val * (1 + mu) + 1e-12 : val)));
-    const step = solveLinear(A, JTr.map((v) => -v));
-    if (!step) break;
-    const next = params.map((v, k) => v + step[k]);
-    const e1 = residuals(next).reduce((s, v) => s + v * v, 0);
-    if (e1 < e0) {
-      params = next;
-      mu = Math.max(mu / 3, 1e-9);
-      if (e0 - e1 < 1e-12) break;
-    } else {
-      mu *= 4;
-      if (mu > 1e6) break;
-    }
-  }
-  const Rf = rodrigues(params.slice(0, 3));
-  const tf = params.slice(3);
-  const err = residuals(params).reduce((s, v) => s + v * v, 0);
-  return { R: Rf, t: tf, err };
-}
-
-/**
- * Focal length (px) implied by one view of a square marker, assuming square pixels
- * and a centred principal point. Needs the marker to be seen at an angle; returns
- * null when the view is too frontal to tell.
- */
-export function estimateFocal(corners, size, cx, cy) {
-  const obj = markerObjectPoints(size);
-  const img = corners.map((c) => [c.x - cx, c.y - cy]);
-  const H = homography4(obj, img);
-  if (!H) return null;
-  const [h11, h12] = [H[0][0], H[0][1]];
-  const [h21, h22] = [H[1][0], H[1][1]];
-  const [h31, h32] = [H[2][0], H[2][1]];
-  const cands = [];
-  const d1 = h31 * h32;
-  const d2 = h31 * h31 - h32 * h32;
-  const scaleRef = Math.hypot(h31, h32);
-  if (scaleRef < 1e-3) return null; // frontal view: no information
-  if (Math.abs(d1) > 1e-6) cands.push({ f2: -(h11 * h12 + h21 * h22) / d1, w: Math.abs(d1) });
-  if (Math.abs(d2) > 1e-6) cands.push({ f2: -(h11 * h11 + h21 * h21 - h12 * h12 - h22 * h22) / d2, w: Math.abs(d2) });
-  const good = cands.filter((c) => c.f2 > 0 && isFinite(c.f2));
-  if (!good.length) return null;
-  good.sort((a, b) => b.w - a.w);
-  return Math.sqrt(good[0].f2);
-}
-
-// ------------------------------------------------------------------ world map helpers
-
-/** World matrix of a wall marker stored as {p:[x,y,z], yaw} (yaw about +Y, radians). */
-export function markerWorldMatrix(m) {
-  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), m.yaw || 0);
-  return new THREE.Matrix4().compose(new THREE.Vector3(...m.p), q, new THREE.Vector3(1, 1, 1));
-}
-
-/** Inverse of markerWorldMatrix for a (near-)vertical marker pose. */
-export function markerFromMatrix(M, size) {
-  const p = new THREE.Vector3().setFromMatrixPosition(M);
-  const z = new THREE.Vector3().setFromMatrixColumn(M, 2);
-  const yaw = Math.atan2(z.x, z.z);
-  return { p: [p.x, p.y, p.z], yaw, size };
-}
-
-/**
- * A marker pose from two points touched in a tracked space (e.g. WebXR local-floor):
- * the marker centre, then any point to its right along the wall. +Y is taken from
- * gravity, so the marker is assumed to hang on a vertical wall.
- */
-export function markerMatrixFromTwoPoints(center, rightPoint) {
-  const xAxis = new THREE.Vector3().subVectors(rightPoint, center);
-  xAxis.y = 0;
-  if (xAxis.lengthSq() < 1e-4) return null; // points too close together
-  xAxis.normalize();
-  const yAxis = new THREE.Vector3(0, 1, 0);
-  const zAxis = new THREE.Vector3().crossVectors(xAxis, yAxis).normalize();
-  return new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis).setPosition(center);
-}
-
-/** World pose of a camera that sees a marker whose world pose is known. */
-export function cameraWorldFromMarker(worldFromMarker, glCamFromMarker) {
-  return worldFromMarker.clone().multiply(glCamFromMarker.clone().invert());
-}
-
-/** Average of several rigid poses (position mean, sign-aligned quaternion mean). */
-export function averagePoses(mats) {
-  if (!mats.length) return null;
-  const pos = new THREE.Vector3();
-  const qs = mats.map((m) => {
-    const p = new THREE.Vector3();
-    const q = new THREE.Quaternion();
-    m.decompose(p, q, new THREE.Vector3());
-    pos.add(p);
-    return q;
-  });
-  pos.divideScalar(mats.length);
-  const ref = qs[0];
-  const acc = new THREE.Vector4();
-  for (const q of qs) {
-    const s = q.dot(ref) < 0 ? -1 : 1;
-    acc.x += s * q.x;
-    acc.y += s * q.y;
-    acc.z += s * q.z;
-    acc.w += s * q.w;
-  }
-  const q = new THREE.Quaternion(acc.x, acc.y, acc.z, acc.w).normalize();
-  return new THREE.Matrix4().compose(pos, q, new THREE.Vector3(1, 1, 1));
-}
-
-/**
- * Mean of several detections of the same marker (each four {x, y} corners).
- * Averaging the corners before solving the pose cuts pixel noise by sqrt(N) and,
- * unlike averaging per-frame poses, cannot mix the two mirror-image solutions a
- * small or distant marker flips between.
- */
-export function averageCorners(list) {
-  if (!list.length) return null;
-  return [0, 1, 2, 3].map((i) => ({
-    x: list.reduce((s, c) => s + c[i].x, 0) / list.length,
-    y: list.reduce((s, c) => s + c[i].y, 0) / list.length,
-  }));
-}
-
-/** Width of a detected marker in pixels (mean edge length). */
-export function markerPixelSize(c) {
-  let s = 0;
-  for (let i = 0; i < 4; i++) s += Math.hypot(c[i].x - c[(i + 1) % 4].x, c[i].y - c[(i + 1) % 4].y);
-  return s / 4;
-}
-
-/** Spread of a set of poses: max position deviation (m) and max angle deviation (deg). */
-export function poseSpread(mats, mean) {
-  const mp = new THREE.Vector3().setFromMatrixPosition(mean);
-  const mq = new THREE.Quaternion().setFromRotationMatrix(mean);
-  let dp = 0;
-  let da = 0;
-  for (const m of mats) {
-    dp = Math.max(dp, new THREE.Vector3().setFromMatrixPosition(m).distanceTo(mp));
-    da = Math.max(da, THREE.MathUtils.radToDeg(new THREE.Quaternion().setFromRotationMatrix(m).angleTo(mq)));
-  }
-  return { position: dp, angle: da };
-}
+// ------------------------------------------------------------------ pose messages
 
 export function poseToMsg(M) {
   const p = new THREE.Vector3();
@@ -509,4 +196,265 @@ export function projectBox(p, s, K, worldFromCam, camFromWorld = worldFromCam.cl
   }
   if (maxU < 0 || maxV < 0 || minU > K.w || minV > K.h) return null;
   return { x: minU, y: minV, w: maxU - minU, h: maxV - minV };
+}
+
+// ---------------------------------------------------------------- marker-free calibration
+//
+// A fixed camera finds its own pose by watching the headset wearer walk around:
+// the headset reports where the wearer's head is (world frame), the camera sees
+// where the head and feet are in its picture at the same moment. Many such pairs
+// give the camera's pose (a perspective-n-point problem).
+
+function projectPointCV(R, t, f, P, K) {
+  const X = R[0][0] * P[0] + R[0][1] * P[1] + R[0][2] * P[2] + t[0];
+  const Y = R[1][0] * P[0] + R[1][1] * P[1] + R[1][2] * P[2] + t[1];
+  const Z = R[2][0] * P[0] + R[2][1] * P[1] + R[2][2] * P[2] + t[2];
+  return [K.cx + (f * X) / Z, K.cy + (f * Y) / Z, Z];
+}
+
+/** Weighted pixel residuals of one observation (only the coordinates it constrains). */
+function obsResiduals(R, t, f, o, K, out) {
+  const q = projectPointCV(R, t, f, o.X, K);
+  const w = o.w ?? 1;
+  if (q[2] <= 0.05) {
+    if (o.u != null) out.push(1e3);
+    if (o.v != null) out.push(1e3);
+    return;
+  }
+  if (o.u != null) out.push((q[0] - o.u) * w);
+  if (o.v != null) out.push((q[1] - o.v) * w);
+}
+
+function obsError(R, t, f, o, K) {
+  const r = [];
+  obsResiduals(R, t, f, o, K, r);
+  return Math.hypot(...r);
+}
+
+/**
+ * Levenberg-Marquardt on pixel reprojection error, starting from focal length fStart.
+ * With refineFocal, the focal length is refined too, with a weak pull towards K.f.
+ */
+function refineCamera(R, t, fStart, obs, K, refineFocal, maxIter = 40) {
+  const nP = refineFocal ? 7 : 6;
+  const f0 = refineFocal ? K.f : fStart;
+  let params = [...rotToRodrigues(R), ...t];
+  if (refineFocal) params.push(Math.log(fStart / K.f)); // log(f / K.f)
+  const residuals = (p) => {
+    const Rp = rodrigues(p.slice(0, 3));
+    const tp = p.slice(3, 6);
+    const f = refineFocal ? f0 * Math.exp(p[6]) : f0;
+    const r = [];
+    for (const o of obs) obsResiduals(Rp, tp, f, o, K, r);
+    // Weak prior: keep the focal length near the configured FOV unless the data disagree.
+    if (refineFocal) r.push(p[6] * 60);
+    return r;
+  };
+  const sq = (r) => r.reduce((s, v) => s + v * v, 0);
+  let mu = 1e-3;
+  let r0 = residuals(params);
+  let e0 = sq(r0);
+  for (let iter = 0; iter < maxIter; iter++) {
+    const J = r0.map(() => new Array(nP).fill(0));
+    for (let j = 0; j < nP; j++) {
+      const d = j < 3 || j === 6 ? 1e-6 : 1e-6 * Math.max(1, Math.abs(params[j]));
+      const p2 = params.slice();
+      p2[j] += d;
+      const r2 = residuals(p2);
+      for (let i = 0; i < r0.length; i++) J[i][j] = (r2[i] - r0[i]) / d;
+    }
+    const JTJ = Array.from({ length: nP }, () => new Array(nP).fill(0));
+    const JTr = new Array(nP).fill(0);
+    for (let i = 0; i < r0.length; i++) {
+      const Ji = J[i];
+      for (let a = 0; a < nP; a++) {
+        if (!Ji[a]) continue;
+        JTr[a] += Ji[a] * r0[i];
+        for (let b = 0; b < nP; b++) JTJ[a][b] += Ji[a] * Ji[b];
+      }
+    }
+    const A = JTJ.map((row, k) => row.map((val, j) => (j === k ? val * (1 + mu) + 1e-9 : val)));
+    const step = solveLinear(A, JTr.map((v) => -v));
+    if (!step) break;
+    const next = params.map((v, k) => v + step[k]);
+    const r1 = residuals(next);
+    const e1 = sq(r1);
+    if (e1 < e0) {
+      params = next;
+      r0 = r1;
+      const gain = e0 - e1;
+      e0 = e1;
+      mu = Math.max(mu / 3, 1e-9);
+      if (gain < 1e-9 * e0) break;
+    } else {
+      mu *= 4;
+      if (mu > 1e8) break;
+    }
+  }
+  return { R: rodrigues(params.slice(0, 3)), t: params.slice(3, 6), f: refineFocal ? f0 * Math.exp(params[6]) : f0 };
+}
+
+const median = (a) => {
+  const s = a.slice().sort((x, y) => x - y);
+  return s.length ? s[Math.floor(s.length / 2)] : Infinity;
+};
+
+/**
+ * Camera pose from observations of known world points.
+ * obs: [{X:[x,y,z], u?, v?, g?, w?}] - where the camera saw world point X; u (horizontal pixel),
+ *      v (vertical pixel) or both. g groups observations from the same frame: random
+ *      samples take whole frames, since a wrong frame (someone else) is wrong throughout.
+ *      w weights an observation (default 1); errors are measured weighted.
+ * K: intrinsics (its f is the starting guess).
+ * Robust to outliers: many starting guesses, then refinement on the frames that fit. Returns
+ *   {worldFromCam (GL camera, Matrix4), f, fovH, error (median px), inliers, total} or null.
+ */
+export function solveCameraFromObservations(obs, K, { refineFocal = true, threshold = null } = {}) {
+  const n = obs.length;
+  if (n < 12) return null;
+  const thr = threshold ?? Math.max(12, K.w * 0.025);
+  // Frames (groups): an inlier frame has every one of its observations within the
+  // threshold. Judging whole frames stops "solutions" that fit one kind of observation
+  // (say, only the vertical box edges) and ignore the rest.
+  const groupMap = new Map();
+  obs.forEach((o, i) => {
+    const g = o.g ?? i;
+    if (!groupMap.has(g)) groupMap.set(g, []);
+    groupMap.get(g).push(i);
+  });
+  const groups = [...groupMap.values()];
+  if (groups.length < 5) return null;
+  const frameErrors = (R, t, f) => {
+    const e = obs.map((o) => obsError(R, t, f, o, K));
+    return { obsErr: e, frameErr: groups.map((ids) => Math.max(...ids.map((i) => e[i]))) };
+  };
+  // MSAC score: lower is better; inliers cost their squared error, outliers a fixed amount.
+  const scoreOf = (R, t, f) => frameErrors(R, t, f).frameErr.reduce((s, e) => s + Math.min(e * e, thr * thr), 0);
+
+  // Starting guesses: the camera has to see where the person walked, so put it 1.5-6 m
+  // from the middle of the walk, all the way round, at a few heights, looking at it.
+  let cx = 0, cz = 0;
+  for (const o of obs) {
+    cx += o.X[0];
+    cz += o.X[2];
+  }
+  cx /= n;
+  cz /= n;
+  const sub = groups.length > 40 ? groups.filter((_, i) => i % Math.ceil(groups.length / 40) === 0).flat().map((i) => obs[i]) : obs;
+  const starts = [];
+  for (let a = 0; a < 16; a++) {
+    for (const d of [1.8, 3.2, 5.5]) {
+      for (const h of [0.8, 1.8, 2.6]) {
+        const eye = new THREE.Vector3(cx + Math.sin((a / 16) * Math.PI * 2) * d, h, cz + Math.cos((a / 16) * Math.PI * 2) * d);
+        const worldFromGl = new THREE.Matrix4().lookAt(eye, new THREE.Vector3(cx, 0.9, cz), new THREE.Vector3(0, 1, 0)).setPosition(eye);
+        const cv = CV_TO_GL.clone().multiply(worldFromGl.clone().invert()).elements;
+        const R = [
+          [cv[0], cv[4], cv[8]],
+          [cv[1], cv[5], cv[9]],
+          [cv[2], cv[6], cv[10]],
+        ];
+        const t = [cv[12], cv[13], cv[14]];
+        const sol = refineCamera(R, t, K.f, sub, K, false, 12);
+        starts.push({ ...sol, score: scoreOf(sol.R, sol.t, sol.f) });
+      }
+    }
+  }
+  starts.sort((a, b) => a.score - b.score);
+
+  // Refine the most promising few on their inlier frames, re-select, refine again.
+  let best = null;
+  for (const st0 of starts.slice(0, 4)) {
+    let { R, t, f } = st0;
+    let ok = true;
+    for (let round = 0; round < 4; round++) {
+      const { frameErr } = frameErrors(R, t, f);
+      const keep = groups.filter((_, gi) => frameErr[gi] < thr * (round ? 1 : 2.5)).flat().map((i) => obs[i]);
+      if (keep.length < 12) {
+        ok = false;
+        break;
+      }
+      const sol = refineCamera(R, t, f, keep, K, refineFocal && keep.length >= 40 && round > 0);
+      ({ R, t, f } = sol);
+    }
+    if (!ok) continue;
+    const score = scoreOf(R, t, f);
+    if (!best || score < best.score) best = { R, t, f, score };
+  }
+  if (!best) return null;
+  const { R, t, f } = best;
+  const { obsErr, frameErr } = frameErrors(R, t, f);
+  const cv = new THREE.Matrix4().set(
+    R[0][0], R[0][1], R[0][2], t[0],
+    R[1][0], R[1][1], R[1][2], t[1],
+    R[2][0], R[2][1], R[2][2], t[2],
+    0, 0, 0, 1
+  );
+  const worldFromCam = CV_TO_GL.clone().multiply(cv).invert();
+  return {
+    worldFromCam,
+    f,
+    fovH: fovFromFocal(f, K.w),
+    error: median(obsErr.filter((e) => e < thr)),
+    inliers: frameErr.filter((e) => e < thr).length, // frames that fit
+    total: groups.length, // frames
+  };
+}
+
+/** Same, for full point/pixel pairs: points [[x,y,z]], pixels [[u,v]]. */
+export function solveCameraFromPoints(points, pixels, K, opts) {
+  return solveCameraFromObservations(points.map((X, i) => ({ X, u: pixels[i][0], v: pixels[i][1] })), K, opts);
+}
+
+/**
+ * Rotation about +Y plus a floor translation that best maps src onto dst (both [[x,z]]),
+ * robust to outliers. Used to place the headset's tracking space in the shared world
+ * from where calibrated cameras saw the wearer. Returns {matrix: dst <- src, rms, inliers} or null.
+ */
+export function fitFloorTransform(src, dst, { threshold = 0.5, iterations = 200 } = {}) {
+  const n = src.length;
+  if (n < 3) return null;
+  const fit = (ids) => {
+    let ax = 0, az = 0, bx = 0, bz = 0;
+    for (const i of ids) {
+      ax += src[i][0];
+      az += src[i][1];
+      bx += dst[i][0];
+      bz += dst[i][1];
+    }
+    ax /= ids.length;
+    az /= ids.length;
+    bx /= ids.length;
+    bz /= ids.length;
+    let sc = 0, ss = 0;
+    for (const i of ids) {
+      const a0 = src[i][0] - ax, a1 = src[i][1] - az;
+      const b0 = dst[i][0] - bx, b1 = dst[i][1] - bz;
+      sc += b0 * a0 + b1 * a1;
+      ss += b0 * a1 - b1 * a0;
+    }
+    const th = Math.atan2(ss, sc);
+    const c = Math.cos(th), s = Math.sin(th);
+    // makeRotationY(th): x' = c x + s z, z' = -s x + c z
+    return { th, tx: bx - (c * ax + s * az), tz: bz - (-s * ax + c * az) };
+  };
+  const errOf = (T, i) => {
+    const c = Math.cos(T.th), s = Math.sin(T.th);
+    return Math.hypot(c * src[i][0] + s * src[i][1] + T.tx - dst[i][0], -s * src[i][0] + c * src[i][1] + T.tz - dst[i][1]);
+  };
+  const all = [...Array(n).keys()];
+  let best = null;
+  for (let it = 0; it < iterations; it++) {
+    const a = Math.floor(Math.random() * n);
+    const b = Math.floor(Math.random() * n);
+    if (a === b || Math.hypot(src[a][0] - src[b][0], src[a][1] - src[b][1]) < 0.5) continue;
+    const T = fit([a, b]);
+    const inl = all.filter((i) => errOf(T, i) < threshold);
+    if (!best || inl.length > best.inl.length) best = { T, inl };
+  }
+  if (!best || best.inl.length < 3) return null;
+  let T = fit(best.inl);
+  const inl = all.filter((i) => errOf(T, i) < threshold);
+  if (inl.length >= 3) T = fit(inl);
+  const rms = Math.sqrt(inl.reduce((s, i) => s + errOf(T, i) ** 2, 0) / inl.length);
+  return { matrix: new THREE.Matrix4().makeRotationY(T.th).setPosition(T.tx, 0, T.tz), rms, inliers: inl.length, total: n };
 }

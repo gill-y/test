@@ -8,7 +8,7 @@
 //
 // Only detections and device positions are drawn: never anyone's video.
 //
-// World frame: metres, +Y up. On the map +X is right and -Z is up ("north-up"), or,
+// World frame: metres, +Y up (the headset's map). On the map +X is right and -Z is up, or,
 // in follow mode, the map turns so the viewer's facing direction is always up.
 
 const TAU = Math.PI * 2;
@@ -84,7 +84,6 @@ export class Minimap {
    *   self:    {p:[x,z], heading, color, name, kind:'headset'|'camera', fovH} | null
    *   devices: [{id, p:[x,z], heading, color, name, kind, fovH, stale}]
    *   objects: [{p:[x,z], label, color, mine}]
-   *   markers: [{id, p:[x,z], yaw}]
    *   recording: true while this device's own camera is on
    * }
    */
@@ -96,13 +95,12 @@ export class Minimap {
     const u = size / 220; // design unit: sizes below are for a 220 px map
     const devices = data.devices || [];
     const objects = data.objects || [];
-    const markers = data.markers || [];
 
     const target = computeView({
       size,
       follow: this.follow,
       self: data.self,
-      points: [...devices.map((d) => d.p), ...objects.map((o) => o.p), ...markers.map((m) => m.p)],
+      points: [...devices.map((d) => d.p), ...objects.map((o) => o.p)],
       range: this.range,
     });
     // Ease the fit-mode zoom so the map doesn't jump every time something moves.
@@ -140,14 +138,6 @@ export class Minimap {
         const b = worldToMap(v.cx + half, z, v);
         line(g, a, b);
       }
-    }
-
-    // Markers: short bars along their wall.
-    g.strokeStyle = 'rgba(255, 210, 63, 0.8)';
-    g.lineWidth = 3 * u;
-    for (const m of markers) {
-      const along = [Math.cos(m.yaw || 0) * 0.12, -Math.sin(m.yaw || 0) * 0.12];
-      line(g, worldToMap(m.p[0] - along[0], m.p[1] - along[1], v), worldToMap(m.p[0] + along[0], m.p[1] + along[1], v));
     }
 
     // Devices: cameras get a field-of-view wedge, headsets an arrow.
@@ -234,11 +224,6 @@ export class Minimap {
     g.font = `${10 * u}px system-ui, sans-serif`;
     g.fillStyle = '#9fb3c8';
     g.fillText(this.follow ? `rings ${barM} m` : `${barM} m`, 10 * u, by - 3 * u);
-    if (!this.follow) {
-      g.textAlign = 'right';
-      g.fillText('↑ marker wall', size - 10 * u, by + 4 * u);
-      g.textAlign = 'left';
-    }
     g.restore();
 
     // Border drawn after restoring the clip so it stays crisp.

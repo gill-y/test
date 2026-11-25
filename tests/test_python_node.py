@@ -1,10 +1,11 @@
-"""Integration test for the Python camera node (no camera or YOLO needed).
+"""Integration test for the Python camera node (no camera, YOLO or markers needed).
 
-1. Renders a video of a printed marker on a wall from a known camera pose.
-2. Runs the real Node class on that video with --calibrate, against a running relay,
-   with YOLO swapped for a stand-in that reports a known person box.
-3. A viewer client in the same room checks the map, the camera pose and the person's
-   world position that arrive through the relay.
+1. A fake headset joins the room, starts the map and streams its position while its
+   wearer walks a loop in front of the camera (as a real headset would).
+2. The real Node class runs with --calibrate against a running relay, with YOLO swapped
+   for a stand-in that reports the box a detector would draw around the wearer.
+3. A viewer client in the same room checks the camera pose and the person's world
+   position that arrive through the relay.
 
 Run with the relay up:  node server/server.js --http --port=8080
 Then:                   python -I tests/test_python_node.py ws://localhost:8080/ws
@@ -17,6 +18,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -25,11 +27,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python-node"))
 import seethrough_node as sn  # noqa: E402
 
-W, H, FOV = 1280, 720, 65.0
-MARKER = {"p": [0.0, 1.5, 0.0], "yaw": 0.0, "size": 0.15}
-CAM_POS = np.array([0.7, 1.7, 1.8])
-LOOK_AT = np.array([0.0, 1.3, 0.0])
-PERSON = {"p": [-0.4, 0.85, 1.2], "s": [0.5, 1.7, 0.4]}
+W, H, FOV = 1280, 720, 68.0  # true FOV; the node starts from its default guess (65°)
+CAM_POS = np.array([0.6, 2.2, 3.6])
+LOOK_AT = np.array([0.0, 0.8, 0.0])
+EYE = 1.62
+WORLD_ID = "w-pytest"
 
 
 def look_at(eye, target):
@@ -44,46 +46,55 @@ def look_at(eye, target):
     return M
 
 
-def project(world_from_cam, intr, pts):
-    cam_from_world = np.linalg.inv(world_from_cam)
-    out = []
-    for p in pts:
-        v = cam_from_world @ np.append(p, 1.0)
-        out.append([intr.K[0, 2] + intr.f * v[0] / -v[2], intr.K[1, 2] - intr.f * v[1] / -v[2]])
-    return np.array(out, dtype=np.float32)
+WORLD_FROM_CAM = look_at(CAM_POS, LOOK_AT)
+CAM_FROM_WORLD = np.linalg.inv(WORLD_FROM_CAM)
+F = W / 2 / math.tan(math.radians(FOV) / 2)
 
 
-def render_video(path, world_from_cam, intr, frames=60):
-    marker_px = 400
-    tag = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(sn.MARKER_DICT), 7, marker_px)
-    Mw = sn.marker_world_matrix(MARKER)
-    corners_w = [(Mw @ np.append(p, 1.0))[:3] for p in sn.marker_object_points(MARKER["size"])]
-    dst = project(world_from_cam, intr, corners_w)
-    src = np.array([[0, 0], [marker_px, 0], [marker_px, marker_px], [0, marker_px]], dtype=np.float32)
-    Hm = cv2.getPerspectiveTransform(src, dst)
-    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 30, (W, H))
-    rng = np.random.default_rng(1)
-    for _ in range(frames):
-        bg = np.full((H, W), 225, np.uint8)
-        bg[int(H * 0.72):] = 140  # floor
-        warped = cv2.warpPerspective(tag, Hm, (W, H), flags=cv2.INTER_LINEAR, borderValue=255)
-        mask = cv2.warpPerspective(np.full_like(tag, 255), Hm, (W, H)) > 0
-        img = bg.copy()
-        img[mask] = warped[mask]
-        noise = rng.normal(0, 2.0, img.shape)
-        img = np.clip(img + noise, 0, 255).astype(np.uint8)
-        vw.write(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
-    vw.release()
-    return dst
+def wearer(t):
+    """Where the wearer's eyes are at time t (s): a slow wobbly loop, 1.5-5 m from the camera."""
+    a = t * 0.55
+    return np.array([math.sin(a) * 1.6, EYE + 0.02 * math.sin(t * 7), -0.2 + math.cos(a * 1.3) * 1.2])
 
 
-def person_bbox(world_from_cam, intr):
-    p, s = np.array(PERSON["p"]), np.array(PERSON["s"])
-    pts = [p + s * np.array([dx, dy, dz]) for dx in (-0.5, 0.5) for dy in (-0.5, 0.5) for dz in (-0.5, 0.5)]
-    uv = project(world_from_cam, intr, pts)
-    x1, y1 = uv.min(axis=0)
-    x2, y2 = uv.max(axis=0)
+def project(p):
+    v = CAM_FROM_WORLD @ np.append(p, 1.0)
+    return np.array([W / 2 + F * v[0] / -v[2], H / 2 - F * v[1] / -v[2]])
+
+
+def person_box(t, rng):
+    """The box a detector would draw: head top, shoulders facing the camera, feet."""
+    e = wearer(t)
+    to_cam = np.array([CAM_POS[0] - e[0], 0, CAM_POS[2] - e[2]])
+    to_cam /= np.linalg.norm(to_cam)
+    side = np.array([-to_cam[2], 0, to_cam[0]])
+    pts = [np.array([e[0], e[1] + sn.HEAD_TOP_ABOVE_EYES, e[2]])]
+    for hgt, half in ((e[1] - 0.2, 0.22), (0.9, 0.18)):
+        for s in (-1, 1):
+            pts.append(np.array([e[0], hgt, e[2]]) + side * half * s)
+    for d in (-0.1, 0.15):
+        pts.append(np.array([e[0], 0.0, e[2]]) + to_cam * d)
+    uv = np.array([project(p) for p in pts])
+    x1, y1 = uv.min(axis=0) + rng.normal(0, 3, 2)
+    x2, y2 = uv.max(axis=0) + rng.normal(0, 3, 2)
     return (float(x1), float(y1), float(x2 - x1), float(y2 - y1))
+
+
+async def headset(relay, room, stop):
+    """Fake headset: starts the map, announces itself, streams its pose at 20 Hz."""
+    import websockets
+
+    async with websockets.connect(relay) as ws:
+        await ws.send(json.dumps({"t": "hello", "room": room, "role": "viewer", "name": "Headset", "id": "test-headset"}))
+        welcome = json.loads(await ws.recv())
+        offset = welcome["serverTime"] - time.time() * 1000
+        await ws.send(json.dumps({"t": "map", "map": {"worldId": WORLD_ID, "created": 0}}))
+        await ws.send(json.dumps({"t": "camera", "id": "test-headset", "name": "Headset", "kind": "headset", "pose": None, "active": True}))
+        while not stop.is_set():
+            t = time.time()
+            e = wearer(t)
+            await ws.send(json.dumps({"t": "pose", "id": "test-headset", "ts": t * 1000 + offset, "pose": {"p": e.tolist(), "q": [0, 0, 0, 1]}}))
+            await asyncio.sleep(0.05)
 
 
 async def viewer(relay, room, result, done):
@@ -93,79 +104,60 @@ async def viewer(relay, room, result, done):
         await ws.send(json.dumps({"t": "hello", "room": room, "role": "viewer", "name": "test viewer", "id": "test-viewer"}))
         async for raw in ws:
             m = json.loads(raw)
-            if m["t"] == "map" or (m["t"] == "welcome" and m.get("map")):
-                result["map"] = m["map"]
-            if m["t"] == "camera" and m.get("pose"):
+            if m["t"] == "camera" and m.get("pose") and m.get("kind") == "python":
                 result["camera"] = m
-            if m["t"] == "objects" and m["objs"]:
+            if m["t"] == "objects" and m["objs"] and "camera" in result:
                 result["objects"] = m
-                if "camera" in result:
-                    done.set()
-                    return
+                result["truth"] = wearer(time.time()).tolist()
+                done.set()
+                return
 
 
 def main():
     relay = sys.argv[1] if len(sys.argv) > 1 else "ws://localhost:8080/ws"
     room = "PYTEST" + str(os.getpid() % 1000)
-    intr = sn.Intrinsics.from_fov(W, H, FOV)
-    world_from_cam = look_at(CAM_POS, LOOK_AT)
     tmp = tempfile.mkdtemp()
-    video = os.path.join(tmp, "marker.avi")
-    corners = render_video(video, world_from_cam, intr)
-    print(f"Rendered test video: marker {np.linalg.norm(corners[0] - corners[1]):.0f} px wide")
+    video = os.path.join(tmp, "blank.avi")
+    vw = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*"MJPG"), 30, (W, H))
+    for _ in range(30):
+        vw.write(np.full((H, W, 3), 200, np.uint8))
+    vw.release()
 
-    bbox = person_bbox(world_from_cam, intr)
     args = sn.parse_args([
         "--relay", relay, "--room", room, "--source", video, "--name", "Test node", "--calibrate",
-        "--fov", str(FOV), "--marker-size", str(MARKER["size"]), "--anchor-height", str(MARKER["p"][1]),
         "--calib-file", os.path.join(tmp, "calib.json"), "--i-own-this-camera",
     ])
     node = sn.Node(args)
-    node._detect = lambda frame: [{"label": "person", "score": 0.9, "bbox": bbox, "tid": 1}]
+    rng = np.random.default_rng(3)
+    node._detect = lambda frame: [{"label": "person", "score": 0.9, "bbox": person_box(time.time(), rng), "tid": 1}]
 
+    stop = threading.Event()
     result, done = {}, threading.Event()
-    t = threading.Thread(target=lambda: asyncio.run(node.run()), daemon=True)
-
-    async def drive():
-        stop = asyncio.Event()
-        vtask = asyncio.create_task(viewer(relay, room, result, stop))
-        await asyncio.sleep(0.3)
-        t.start()
-        try:
-            await asyncio.wait_for(stop.wait(), 30)
-        finally:
-            vtask.cancel()
-
-    asyncio.run(drive())
+    threading.Thread(target=lambda: asyncio.run(headset(relay, room, stop)), daemon=True).start()
+    time.sleep(0.5)
+    threading.Thread(target=lambda: asyncio.run(node.run()), daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(viewer(relay, room, result, done)), daemon=True).start()
+    ok = done.wait(120)
+    stop.set()
     node.stop.set()
 
-    failures = 0
+    fails = 0
 
-    def check(name, ok, detail=""):
-        nonlocal failures
-        print(("PASS" if ok else "FAIL"), name, f"({detail})" if detail else "")
-        failures += 0 if ok else 1
+    def check(name, cond, detail=""):
+        nonlocal fails
+        print(f"{'PASS' if cond else 'FAIL'}  {name}" + (f"  ({detail})" if detail else ""))
+        fails += 0 if cond else 1
 
-    check("map created by the node", result.get("map", {}).get("anchor") == "7", json.dumps(result.get("map")))
-    cam = result.get("camera", {})
-    if cam.get("pose"):
-        p = np.array(cam["pose"]["p"])
+    check("node calibrated by walking and sent objects", ok)
+    if ok:
+        p = np.array(result["camera"]["pose"]["p"])
         err = float(np.linalg.norm(p - CAM_POS))
-        check("camera pose from marker calibration", err < 0.05, f"{err * 100:.1f} cm")
-    else:
-        check("camera pose from marker calibration", False, "no pose received")
-    objs = result.get("objects", {}).get("objs", [])
-    if objs:
-        o = objs[0]
-        err = math.hypot(o["p"][0] - PERSON["p"][0], o["p"][2] - PERSON["p"][2])
-        # Floor projection puts the object where the bottom of its 2D box meets the floor,
-        # which for a box seen at a steep angle is its nearest corner: ~20-30 cm of bias
-        # here even with a perfect camera pose. A depth camera removes it.
-        check("person position in world through the relay", err < 0.35, f"{err * 100:.1f} cm, height {o['s'][1]:.2f} m, id {o['id']}")
-    else:
-        check("person position in world through the relay", False, "no objects received")
-    print("All Python node tests passed" if not failures else f"{failures} failed")
-    sys.exit(1 if failures else 0)
+        check("camera pose from walk calibration", err < 0.5, f"{err * 100:.1f} cm, FOV {node.state.calib['fovH']:.1f}° (true {FOV})")
+        obj = result["objects"]["objs"][0]["p"]
+        t = result["truth"]
+        d = math.hypot(obj[0] - t[0], obj[2] - t[2])
+        check("person position through the relay", d < 0.6, f"{d * 100:.0f} cm on the floor")
+    sys.exit(1 if fails else 0)
 
 
 if __name__ == "__main__":

@@ -17,9 +17,9 @@ import { msgToPose, poseToMsg, floorPose, headWorldPose, intrinsicsFromFov, dete
 import { Minimap } from '../common/minimap.js';
 import { Tracker } from '../common/tracker.js';
 import { ObjectVisual } from './xray.js';
-import { MarkerVisuals, CameraVisuals, buildSimHouse, TruthVisuals } from './scene-extras.js';
+import { CameraVisuals, buildSimHouse, TruthVisuals } from './scene-extras.js';
 import { XRPanel } from './xr-panel.js';
-import { Aligner } from './alignment.js';
+import { Relocalizer } from '../common/walkcal.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -37,7 +37,6 @@ const state = {
   xray: true,
   labels: true,
   showCams: true,
-  showMarkers: true,
   showTruth: false,
   showMinimap: safeGet('seethrough.minimap') !== 'off',
   selfPose: null, // Matrix4 world <- this headset / desktop view, or null when not aligned
@@ -87,10 +86,9 @@ const grid = new THREE.GridHelper(30, 30, '#1e2a3a', '#141c28');
 worldRoot.add(grid);
 
 const objectsGroup = new THREE.Group();
-const markerVis = new MarkerVisuals();
 const cameraVis = new CameraVisuals();
 const truthVis = new TruthVisuals();
-worldRoot.add(objectsGroup, markerVis.group, cameraVis.group, truthVis.group);
+worldRoot.add(objectsGroup, cameraVis.group, truthVis.group);
 let simHouse = null;
 
 // ------------------------------------------------------------------ desktop controls
@@ -230,8 +228,14 @@ function setStatus(status) {
 }
 
 function setMap(map) {
-  state.map = map || null;
-  markerVis.setMap(state.map);
+  const before = state.map?.worldId;
+  state.map = map && map.worldId ? map : null;
+  // Someone else started a new map while this headset was in it: find our place again.
+  if (renderer.xr.isPresenting && world.state === 'aligned' && state.map && state.map.worldId !== before && state.map.worldId !== world.createdHere) {
+    world.xrFromWorld = null;
+    world.anchor = null;
+    startSearching('Another device started a new map. Walk in front of a calibrated camera so this headset can find its place.');
+  }
 }
 
 function onCamera(info) {
@@ -281,7 +285,7 @@ let lastPoseSent = 0;
 function sendSelfPose(now) {
   if (!state.link || !state.selfPose || now - lastPoseSent < 1000 / POSE_HZ) return;
   lastPoseSent = now;
-  state.link.send({ t: 'pose', id: state.id, pose: poseToMsg(state.selfPose) });
+  state.link.send({ t: 'pose', id: state.id, ts: state.link.now(), pose: poseToMsg(state.selfPose) });
 }
 
 function removeCamera(id) {
@@ -308,6 +312,7 @@ function onObjects(msg) {
   }
   c.lastSeen = performance.now();
   c.objCount = msg.objs.length;
+  feedRelocalizer(msg, c);
   state.updates++;
   const lat = state.link.now() - msg.ts;
   if (isFinite(lat) && lat > -500 && lat < 10000) {
@@ -349,7 +354,7 @@ function renderCameraList() {
     const div = document.createElement('div');
     div.className = 'cam';
     div.dataset.cam = id;
-    const calibrated = c.matrix ? (c.info.calibratedWith != null ? `calibrated on marker ${c.info.calibratedWith}` : 'calibrated') : 'not calibrated';
+    const calibrated = c.matrix ? 'calibrated' : 'not calibrated';
     div.innerHTML = `
       <span class="swatch" style="background:${c.info.color};box-shadow:0 0 8px ${c.info.color}"></span>
       <span class="name"></span>
@@ -369,7 +374,7 @@ function refreshCameraMeta() {
     if (!div) continue;
     const age = (now - c.lastSeen) / 1000;
     div.classList.toggle('stale', age > 3);
-    const calibrated = c.matrix ? (c.info.calibratedWith != null ? `marker ${c.info.calibratedWith}` : 'calibrated') : 'not calibrated';
+    const calibrated = c.matrix ? 'calibrated' : 'not calibrated';
     div.querySelector('.meta').textContent =
       `${c.objCount} object${c.objCount === 1 ? '' : 's'} · ${calibrated} · ${age < 1.5 ? 'live' : `${age.toFixed(0)} s ago`}`;
   }
@@ -410,7 +415,6 @@ function setXray(on) {
 $('t-xray').onchange = (e) => setXray(e.target.checked);
 $('t-labels').onchange = (e) => (state.labels = e.target.checked);
 $('t-cams').onchange = (e) => (state.showCams = e.target.checked);
-$('t-markers').onchange = (e) => (state.showMarkers = e.target.checked);
 $('t-truth').onchange = (e) => (state.showTruth = e.target.checked);
 $('t-minimap').onchange = (e) => setMinimap(e.target.checked);
 $('connect').onclick = connect;
@@ -458,7 +462,7 @@ scene.add(miniXRMesh);
 // Head-relative placement: up and to the left, 0.6 m in front of the eyes.
 const MINI_XR_OFFSET = new THREE.Matrix4().makeTranslation(-0.2, 0.12, -0.6);
 
-/** Everything the mini map shows: devices, their detections and the markers. */
+/** Everything the mini map shows: devices and their detections. */
 function minimapData(now) {
   const self = state.selfPose ? { ...floorPose(state.selfPose), kind: 'headset', color: HEADSET_COLOR, name: 'You' } : null;
   const devices = [];
@@ -471,8 +475,7 @@ function minimapData(now) {
     if (o.dupOf || state.hiddenLabels.has(o.label) || (now - o.lastUpdate) / 1000 > FADE_START_S) continue;
     objects.push({ p: [o.p[0], o.p[2]], label: o.label, color: o.color, mine: o.cam === state.id });
   }
-  const markers = Object.entries(state.map?.markers || {}).map(([id, m]) => ({ id, p: [m.p[0], m.p[2]], yaw: m.yaw }));
-  return { self, devices, objects, markers, recording: headCam.on };
+  return { self, devices, objects, recording: headCam.on };
 }
 
 function setMinimap(on) {
@@ -580,7 +583,7 @@ function runHeadsetDetection(now) {
 
 async function startSim() {
   if (state.sim) return;
-  const [{ Simulator }, world] = await Promise.all([import('../sim/simulator.js'), import('../sim/world.js')]);
+  const [{ Simulator }, simWorld] = await Promise.all([import('../sim/simulator.js'), import('../sim/world.js')]);
   // The simulator connects as its own client, over the same transport as the viewer.
   const simLink = openLink(state.relay, { room: state.room, role: 'sim', name: 'Simulator', id: randomId('s-') });
   await new Promise((res) => {
@@ -591,9 +594,9 @@ async function startSim() {
   state.sim.link = simLink;
   state.sim.start();
   // Local echo of the map so this page's viewer gets it immediately.
-  setMap(world.SIM_MAP);
+  setMap(simWorld.SIM_MAP);
   if (!simHouse) {
-    simHouse = buildSimHouse(world);
+    simHouse = buildSimHouse(simWorld);
     worldRoot.add(simHouse);
   }
   simHouse.visible = !renderer.xr.isPresenting;
@@ -619,27 +622,51 @@ function stopSim() {
 
 $('sim-toggle').onclick = () => (state.sim ? stopSim() : startSim());
 
-// ------------------------------------------------------------------ WebXR
+// ------------------------------------------------------------------ WebXR + the shared world
+//
+// No markers. The headset is the map: the first time, its floor-level tracking space
+// becomes the room's world, saved as a persistent anchor so later sessions land in
+// the same place. If the saved anchor can't be found (cleared, another headset, a
+// browser without anchors), the headset finds its place again by walking in front of
+// cameras that are already calibrated (see Relocalizer).
 
-const aligner = new Aligner({
-  getMap: () => state.map,
-  publishMap: (map) => {
-    setMap(map);
-    state.link?.send({ t: 'map', map });
-  },
-});
+const world = {
+  xrFromWorld: null, // Matrix4: world -> headset tracking space, or null while unknown
+  state: 'none', // 'none' | 'aligned' | 'searching'
+  message: '',
+  confirmNew: false,
+  reloc: new Relocalizer(),
+  lastSolve: 0,
+  anchor: null,
+  anchorSavePending: false,
+  createdHere: null, // worldId this headset created in this session
+};
+
+function setWorldAligned(xrFromWorld, message) {
+  world.xrFromWorld = xrFromWorld;
+  world.state = 'aligned';
+  world.message = message;
+  world.anchorSavePending = true;
+}
+
+function startSearching(message) {
+  world.state = 'searching';
+  world.reloc.reset();
+  world.message = message || 'Walk around in front of a calibrated camera so it can see you. This headset will find its place on the map.';
+}
+
+/** Makes this headset's current tracking space the room's world. Phones must calibrate again. */
+function createNewWorld() {
+  const map = { worldId: randomId('w-'), created: Date.now() };
+  world.createdHere = map.worldId;
+  setMap(map);
+  state.link?.send({ t: 'map', map });
+  setWorldAligned(new THREE.Matrix4(), 'This headset is now the map. Next, calibrate each camera: start it, press Calibrate on it, and walk around in front of it.');
+}
 
 const panel = new XRPanel();
 panel.mesh.visible = false;
 scene.add(panel.mesh);
-
-const tipMarker = new THREE.Mesh(
-  new THREE.SphereGeometry(0.008, 12, 8),
-  new THREE.MeshBasicMaterial({ color: '#ffffff', depthTest: false })
-);
-tipMarker.renderOrder = 3000;
-tipMarker.visible = false;
-scene.add(tipMarker);
 
 const raycaster = new THREE.Raycaster();
 const controllers = [0, 1].map((i) => {
@@ -657,25 +684,12 @@ const controllers = [0, 1].map((i) => {
     ray.visible = !e.data.hand;
   });
   c.addEventListener('disconnected', () => (c.userData.inputSource = null));
-  c.addEventListener('select', () => onSelect(c, i));
+  c.addEventListener('select', () => onSelect(c));
   c.addEventListener('squeeze', () => placePanel());
   scene.add(c);
   return c;
 });
-const hands = [0, 1].map((i) => {
-  const h = renderer.xr.getHand(i);
-  scene.add(h);
-  return h;
-});
-
-/** The point the user touches the wall with: index fingertip, or the controller tip. */
-function touchPoint(i) {
-  const hand = hands[i];
-  const tip = hand.joints?.['index-finger-tip'];
-  if (controllers[i].userData.inputSource?.hand && tip) return tip.getWorldPosition(new THREE.Vector3());
-  const c = controllers[i];
-  return new THREE.Vector3(0, 0, -0.02).applyMatrix4(c.matrixWorld);
-}
+[0, 1].forEach((i) => scene.add(renderer.xr.getHand(i)));
 
 function panelHit(controller) {
   if (!panel.mesh.visible) return null;
@@ -686,23 +700,9 @@ function panelHit(controller) {
   return hit ? { id: panel.buttonAt(hit.uv), distance: hit.distance } : null;
 }
 
-function onSelect(controller, i) {
+function onSelect(controller) {
   const hit = panelHit(controller);
-  if (hit) {
-    if (hit.id) onPanelButton(hit.id);
-    return;
-  }
-  if (aligner.mode !== 'idle') {
-    const msg = aligner.tap(touchPoint(i));
-    if (aligner.aligned) saveAnchor();
-    flashTip();
-    return msg;
-  }
-}
-
-function flashTip() {
-  tipMarker.material.color.set('#4ade80');
-  setTimeout(() => tipMarker.material.color.set('#ffffff'), 300);
+  if (hit?.id) onPanelButton(hit.id);
 }
 
 function placePanel() {
@@ -721,36 +721,51 @@ function onPanelButton(id) {
   if (id === 'xray') setXray(!state.xray);
   else if (id === 'labels') state.labels = !state.labels;
   else if (id === 'cams') state.showCams = !state.showCams;
-  else if (id === 'markers') state.showMarkers = !state.showMarkers;
-  else if (id === 'align') aligner.begin('align');
-  else if (id === 'map') aligner.begin('map');
-  else if (id === 'done') aligner.cancel();
-  else if (id === 'prev') aligner.cycleMarker(-1);
-  else if (id === 'next') aligner.cycleMarker(1);
   else if (id === 'hide') panel.mesh.visible = false;
   else if (id === 'minimap') setMinimap(!state.showMinimap);
-  else if (id === 'headcam') {
+  else if (id === 'refind') startSearching();
+  else if (id === 'newmap') {
+    if (!state.map || world.confirmNew) {
+      world.confirmNew = false;
+      createNewWorld();
+    } else {
+      world.confirmNew = true;
+      world.message = 'A new map means every camera has to calibrate again. Press "Confirm new map" to go ahead.';
+    }
+  } else if (id === 'headcam') {
     if (headCam.on) stopHeadsetCamera();
     else if (!headCam.confirm) {
       headCam.confirm = true;
       headCam.status = 'Only use the headset camera where people nearby know it is on. Press again to start.';
     } else startHeadsetCamera();
-  }
-  else if (id.startsWith('label:')) toggleLabel(id.slice(6));
+  } else if (id.startsWith('label:')) toggleLabel(id.slice(6));
 }
 
 function panelModel() {
   const lat = state.latency === null ? '–' : `${Math.round(state.latency)} ms`;
   const status = state.link?.status === 'open' ? `room ${state.room}` : state.link?.status || 'offline';
+  const calibrated = [...state.cameras.values()].filter((c) => c.matrix && c.info.kind !== 'headset').length;
+  const worldColor = world.state === 'aligned' ? '#4ade80' : '#ffd23f';
+  const worldLines = [{ text: world.message || 'Starting…', color: worldColor }];
+  if (world.state === 'searching') {
+    worldLines.push({ text: calibrated ? `${Math.round(world.reloc.progress() * 100)}% · ${calibrated} calibrated camera${calibrated === 1 ? '' : 's'} watching` : 'No calibrated cameras in this room yet: start a new map instead.', color: '#8c9bb0' });
+  }
   const sections = [
     {
       buttons: [
         { id: 'xray', label: `X-ray ${state.xray ? 'on' : 'off'}`, on: state.xray },
         { id: 'labels', label: 'Labels', on: state.labels },
         { id: 'cams', label: 'Cameras', on: state.showCams },
-        { id: 'markers', label: 'Markers', on: state.showMarkers },
         { id: 'minimap', label: 'Mini map', on: state.showMinimap },
         { id: 'hide', label: 'Hide' },
+      ],
+    },
+    {
+      heading: 'Map',
+      lines: worldLines,
+      buttons: [
+        ...(state.map && calibrated ? [{ id: 'refind', label: world.state === 'searching' ? 'Finding you…' : 'Re-find me', on: world.state === 'searching', accent: '#ffd23f' }] : []),
+        { id: 'newmap', label: world.confirmNew ? 'Confirm new map' : 'New map', on: world.confirmNew, accent: '#f87171' },
       ],
     },
     {
@@ -766,21 +781,6 @@ function panelModel() {
       ],
     },
   ];
-  const alignLines = [{ text: aligner.message || (aligner.aligned ? `Aligned to marker ${aligner.alignedWith}.` : 'Not aligned: outlines are not in the right place yet.'), color: aligner.aligned ? '#4ade80' : '#ffd23f' }];
-  if (aligner.mode === 'idle') {
-    sections.push({ heading: 'Calibration', lines: alignLines, buttons: [{ id: 'align', label: 'Align to marker' }, { id: 'map', label: 'Map rooms' }] });
-  } else {
-    sections.push({
-      heading: aligner.mode === 'map' ? 'Map rooms' : 'Align',
-      lines: alignLines,
-      buttons: [
-        { id: 'prev', label: '◀' },
-        { id: 'marker', label: `Marker ${aligner.markerId}`, on: true, accent: '#ffd23f' },
-        { id: 'next', label: '▶' },
-        { id: 'done', label: 'Done' },
-      ],
-    });
-  }
   if (state.labelCounts.size) {
     sections.push({
       heading: 'Object types',
@@ -789,7 +789,7 @@ function panelModel() {
   }
   const now = performance.now();
   sections.push({
-    heading: 'Cameras',
+    heading: 'Devices',
     lines: state.cameras.size
       ? [...state.cameras.values()].slice(0, 5).map((c) => ({
           dot: c.info.color,
@@ -805,46 +805,56 @@ function panelModel() {
   };
 }
 
-// Persistent anchors (Quest Browser): remember where the world origin is between sessions.
-let anchor = null;
-let anchorSavePending = false;
-const anchorKey = () => `seethrough.anchor.${state.room}`;
-
-async function saveAnchor() {
-  anchorSavePending = true;
-}
+// Persistent anchors (Quest Browser): the world origin, remembered between sessions.
+const anchorKey = () => `seethrough.anchor.${state.room}.${state.map?.worldId || 'none'}`;
 
 async function trySaveAnchor(frame, refSpace) {
-  anchorSavePending = false;
-  if (!frame.createAnchor || !aligner.xrFromWorld) return;
+  world.anchorSavePending = false;
+  if (!frame.createAnchor || !world.xrFromWorld) return;
   try {
     const p = new THREE.Vector3();
     const q = new THREE.Quaternion();
-    aligner.xrFromWorld.decompose(p, q, new THREE.Vector3());
+    world.xrFromWorld.decompose(p, q, new THREE.Vector3());
     const a = await frame.createAnchor(new XRRigidTransform(p, q), refSpace);
     const session = renderer.xr.getSession();
     const old = safeGet(anchorKey());
     if (old && session.deletePersistentAnchor) session.deletePersistentAnchor(old).catch(() => {});
-    if (a.requestPersistentHandle) {
-      const uuid = await a.requestPersistentHandle();
-      safeSet(anchorKey(), uuid);
-    }
-    if (anchor) anchor.delete?.();
-    anchor = a;
+    if (a.requestPersistentHandle) safeSet(anchorKey(), await a.requestPersistentHandle());
+    world.anchor?.delete?.();
+    world.anchor = a;
   } catch (e) {
     console.warn('Anchor not saved:', e);
   }
 }
 
-async function restoreAnchor(session) {
-  const uuid = safeGet(anchorKey());
-  if (!uuid || !session.restorePersistentAnchor) return;
-  try {
-    anchor = await session.restorePersistentAnchor(uuid);
-    aligner.message = 'Restored last alignment from a saved anchor. Re-align if outlines look off.';
-  } catch (e) {
-    console.warn('Could not restore anchor', e);
+/** Session start: saved anchor -> same map; no map yet -> this headset becomes the map; else search. */
+async function setUpWorld(session) {
+  world.xrFromWorld = null;
+  world.confirmNew = false;
+  if (!state.map?.worldId) {
+    createNewWorld();
+    return;
   }
+  const uuid = safeGet(anchorKey());
+  if (uuid && session.restorePersistentAnchor) {
+    world.message = 'Loading your saved map…';
+    try {
+      world.anchor = await session.restorePersistentAnchor(uuid);
+      world.state = 'aligned';
+      world.message = 'Back on your saved map.';
+      return;
+    } catch (e) {
+      console.warn('Could not restore anchor', e);
+    }
+  }
+  startSearching('This headset has no saved place on this map. Walk around in front of a calibrated camera so it can find you, or start a new map.');
+}
+
+/** Person sightings from calibrated cameras feed the search for this headset's place. */
+function feedRelocalizer(msg, cam) {
+  if (world.state !== 'searching' || !renderer.xr.isPresenting) return;
+  if (!cam?.matrix || cam.info.kind === 'headset' || msg.cam === state.id) return;
+  for (const o of msg.objs) if (o.label === 'person') world.reloc.addSighting(msg.ts, o.p);
 }
 
 const arButton = ARButton.createButton(renderer, {
@@ -861,10 +871,8 @@ renderer.xr.addEventListener('sessionstart', () => {
   $('hud').hidden = true;
   $('hint').hidden = true;
   miniCanvas.hidden = true;
-  const session = renderer.xr.getSession();
-  restoreAnchor(session);
+  setUpWorld(renderer.xr.getSession());
   setTimeout(placePanel, 300);
-  if (!aligner.aligned) aligner.message = state.map ? 'Not aligned. Press "Align to marker", then touch a marker.' : 'No map yet. Press "Map rooms" and touch your first marker.';
 });
 renderer.xr.addEventListener('sessionend', () => {
   scene.background = DESKTOP_BG;
@@ -878,9 +886,11 @@ renderer.xr.addEventListener('sessionend', () => {
   stopHeadsetCamera();
   state.selfPose = null;
   panel.mesh.visible = false;
-  tipMarker.visible = false;
-  anchor = null;
+  world.anchor = null;
+  world.xrFromWorld = null;
+  world.state = 'none';
   worldRoot.matrix.identity();
+  worldRoot.visible = true;
 });
 
 // ------------------------------------------------------------------ frame loop
@@ -900,49 +910,56 @@ renderer.setAnimationLoop((t, frame) => {
 
   if (xr && frame) {
     const refSpace = renderer.xr.getReferenceSpace();
-    if (anchorSavePending) trySaveAnchor(frame, refSpace);
-    if (anchor && frame.trackedAnchors?.has(anchor)) {
-      const pose = frame.getPose(anchor.anchorSpace, refSpace);
-      if (pose) aligner.setFromAnchor(new THREE.Matrix4().fromArray(pose.transform.matrix));
+    if (world.anchorSavePending) trySaveAnchor(frame, refSpace);
+    if (world.anchor && frame.trackedAnchors?.has(world.anchor)) {
+      // The anchor sits at the world origin, so its pose is world -> tracking space.
+      const pose = frame.getPose(world.anchor.anchorSpace, refSpace);
+      if (pose && world.state !== 'searching') world.xrFromWorld = new THREE.Matrix4().fromArray(pose.transform.matrix);
     }
-    if (aligner.xrFromWorld) worldRoot.matrix.copy(aligner.xrFromWorld);
+    if (world.xrFromWorld) worldRoot.matrix.copy(world.xrFromWorld);
     else worldRoot.matrix.identity();
     worldRoot.matrixWorldNeedsUpdate = true;
+    // Until the headset knows where it is, outlines would be in the wrong place: hide them.
+    worldRoot.visible = !!world.xrFromWorld;
 
-    // Controller rays: hover the panel, show the touch point while aligning.
     let hover = null;
-    controllers.forEach((c, i) => {
+    controllers.forEach((c) => {
       const h = panelHit(c);
       if (h?.id) hover = h.id;
       if (c.userData.ray) c.userData.ray.scale.z = h ? h.distance : 1.5;
-      if (aligner.mode !== 'idle' && i === 1) {
-        tipMarker.visible = true;
-        tipMarker.position.copy(touchPoint(i));
-      }
     });
-    if (aligner.mode === 'idle') tipMarker.visible = false;
     panel.setHover(hover);
     panel.setModel(panelModel());
     panel.draw();
     renderer.xr.getCamera().getWorldPosition(viewerWorld);
 
-    // Where the headset is in the shared world (only known once aligned to a marker).
     const viewerPose = frame.getViewerPose(refSpace);
     if (viewerPose) {
       xrFromHead.fromArray(viewerPose.transform.matrix);
-      state.selfPose = aligner.xrFromWorld ? headWorldPose(aligner.xrFromWorld, xrFromHead) : null;
+      state.selfPose = world.xrFromWorld ? headWorldPose(world.xrFromWorld, xrFromHead) : null;
       miniXRMesh.matrix.multiplyMatrices(xrFromHead, MINI_XR_OFFSET);
       miniXRMesh.matrixWorldNeedsUpdate = true;
       miniXRMesh.visible = state.showMinimap;
+      if (world.state === 'searching' && state.link) {
+        world.reloc.addOwn(state.link.now(), [xrFromHead.elements[12], xrFromHead.elements[13], xrFromHead.elements[14]]);
+        if (now - world.lastSolve > 500) {
+          world.lastSolve = now;
+          const fit = world.reloc.solve();
+          if (fit) {
+            setWorldAligned(fit.matrix.clone().invert(), `Found your place on the map (±${Math.round(fit.rms * 100)} cm from ${fit.inliers} sightings).`);
+          }
+        }
+      }
     }
     runHeadsetDetection(now);
   } else {
     if (viewMode === 'walk') updateWalk(dt);
     else orbit.update();
     viewerWorld.copy(camera.position);
-    // On the desktop the walk view stands in for the headset, so phones can see it.
+    // In the simulator the desktop walk view stands in for a headset wearer, so phones
+    // can see it. Outside the simulator the desktop view isn't anywhere real.
     camera.updateMatrixWorld();
-    state.selfPose = viewMode === 'walk' ? camera.matrixWorld.clone() : null;
+    state.selfPose = state.sim && viewMode === 'walk' ? camera.matrixWorld.clone() : null;
   }
   sendSelfPose(now);
   invRoot.copy(worldRoot.matrix).invert();
@@ -989,7 +1006,6 @@ renderer.setAnimationLoop((t, frame) => {
     state.labelCounts.set(o.label, (state.labelCounts.get(o.label) || 0) + 1);
   }
   cameraVis.group.visible = state.showCams;
-  markerVis.group.visible = state.showMarkers;
   truthVis.group.visible = state.showTruth && !!state.sim;
   if (truthVis.group.visible) truthVis.update(state.sim.truth());
 
@@ -1038,4 +1054,4 @@ if (qs('sim') === '1' || (!state.relay && qs('sim') !== '0')) {
 }
 
 // Expose a little for debugging from the console.
-window.seethrough = { state, aligner, scene, worldRoot };
+window.seethrough = { state, world, scene, worldRoot };

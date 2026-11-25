@@ -47,7 +47,6 @@
       }
     }
   </script>
-  <script src="js/vendor/js-aruco2.js"></script>
 </head>
 <body>
   <div class="live-banner" id="live-banner" role="status">
@@ -121,19 +120,16 @@
       <section class="card" aria-labelledby="h-calib">
         <h2 id="h-calib">Calibration</h2>
         <p class="calib-state warn" id="calib-state">Not calibrated</p>
-        <p class="muted" id="calib-help">Point the camera so a printed marker is clearly visible, keep the camera still, then press Calibrate. After calibrating, don't move the camera.</p>
-        <div class="grid2">
-          <label class="field">Marker size (cm) <input type="number" id="msize" min="3" max="100" step="0.1" value="15"></label>
-          <label class="field">Field of view (°) <input type="number" id="fov" min="30" max="140" step="0.5" value="65"></label>
-        </div>
-        <label class="field" id="height-row">Anchor marker centre height (m) <input type="number" id="mheight" min="0.2" max="3" step="0.01" value="1.50"></label>
+        <p class="muted" id="calib-help">No markers needed. Put the camera where it will stay. Put on the headset and enter AR, so it's on the map. Then press Calibrate and walk slowly around in front of this camera for 15–30 seconds, crossing the picture from side to side, with your head and feet in view. Don't move the camera afterwards.</p>
+        <label class="field">Field of view (°) <span class="muted" style="font-size: 11px">starting guess, refined by calibration</span>
+          <input type="number" id="fov" min="30" max="140" step="0.5" value="65">
+        </label>
         <div class="progress" aria-hidden="true"><div id="calib-progress"></div></div>
         <div class="row">
           <button class="btn primary" id="calibrate" disabled>Calibrate</button>
-          <button class="btn" id="use-fov" hidden>Use estimated FOV</button>
           <button class="btn" id="clear-calib" hidden>Clear</button>
         </div>
-        <p class="muted"><a href="markers.html" target="_blank" rel="noopener">Print markers</a> · <a href="viewer.html" id="open-viewer" target="_blank" rel="noopener">Open viewer</a></p>
+        <p class="muted"><a href="viewer.html" id="open-viewer" target="_blank" rel="noopener">Open viewer</a></p>
       </section>
     </div>
   </main>

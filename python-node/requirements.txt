@@ -1,4 +1,4 @@
-opencv-python>=4.8   # cv2.aruco with DICT_ARUCO_MIP_36h12 (use opencv-python-headless on a Pi without a display)
+opencv-python>=4.8   # use opencv-python-headless on a Pi without a display
 numpy>=1.24
 websockets>=12
 ultralytics>=8.1     # YOLO detection + tracking; pulls in PyTorch

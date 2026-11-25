@@ -1,57 +1,8 @@
-// Helper geometry for the viewer: marker squares, camera frustums, and the
+// Helper geometry for the viewer: camera frustums, ground-truth outlines and the
 // simulated house (walls + floors) for desktop simulator mode.
 
 import * as THREE from 'three';
-import { markerWorldMatrix } from '../common/geometry.js';
 import { LabelSprite } from './xray.js';
-
-export class MarkerVisuals {
-  constructor() {
-    this.group = new THREE.Group();
-    this.items = new Map();
-  }
-
-  setMap(map, highlightId = null) {
-    for (const it of this.items.values()) this.group.remove(it);
-    this.items.clear();
-    if (!map?.markers) return;
-    for (const [id, m] of Object.entries(map.markers)) {
-      const g = new THREE.Group();
-      g.matrixAutoUpdate = false;
-      g.matrix.copy(markerWorldMatrix(m));
-      const s = m.size || 0.15;
-      const isAnchor = String(map.anchor) === String(id);
-      const color = id === highlightId ? '#ffffff' : isAnchor ? '#ffd23f' : '#9fb3c8';
-      const sq = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.PlaneGeometry(s, s)),
-        new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.9 })
-      );
-      sq.position.z = 0.003;
-      const fill = new THREE.Mesh(
-        new THREE.PlaneGeometry(s, s),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.15, depthTest: false, side: THREE.DoubleSide })
-      );
-      fill.position.z = 0.002;
-      // Short +Z arrow so the facing direction is visible.
-      const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), s * 1.2, color, s * 0.3, s * 0.2);
-      arrow.traverse((o) => {
-        if (o.material) {
-          o.material.depthTest = false;
-          o.material.transparent = true;
-        }
-      });
-      const label = new LabelSprite(color);
-      label.setText(isAnchor ? `Marker ${id} · anchor` : `Marker ${id}`);
-      label.sprite.scale.set(0.09 * label.aspect, 0.09, 1);
-      label.sprite.position.set(0, s / 2 + 0.07, 0.01);
-      g.add(sq, fill, arrow, label.sprite);
-      g.renderOrder = 900;
-      g.traverse((o) => (o.renderOrder = 900));
-      this.group.add(g);
-      this.items.set(id, g);
-    }
-  }
-}
 
 export class CameraVisuals {
   constructor() {

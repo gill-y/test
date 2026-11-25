@@ -1,14 +1,14 @@
 // The simulated house used by simulator mode.
 //
-// World frame = house frame. Marker 0 (the anchor) hangs on the living-room side of
-// the wall between the living room and the kitchen, so the world origin is on the
-// floor right below it and +Z points into the living room, where the viewer stands.
+// World frame = house frame: the origin is on the floor at the middle of the wall
+// between the living room and the kitchen, and +Z points into the living room, where
+// the viewer stands.
 //
 //          z
 //          ^
 //    +-----+-----------+
 //    |  Living room (A)|   <- viewer stands here, looking at -Z (the wall)
-//    |   [M0]          |
+//    |                 |
 //  0 +--door--+--------+
 //    | Kitchen| Bedroom|
 //    |  (B)  door (C)  |
@@ -39,19 +39,12 @@ export const WALLS = [
   [1, 1.12, -5.12, -4.4],
 ];
 
-// The pre-built marker map for the simulated house (as if setup mode had been run).
-export const SIM_MAP = {
-  anchor: '0',
-  markers: {
-    0: { p: [0, 1.5, 0], yaw: 0, size: 0.2 }, // living-room side of the middle wall, faces +Z
-    1: { p: [-1.6, 1.5, -0.12], yaw: Math.PI, size: 0.2 }, // kitchen side, faces -Z
-    2: { p: [4, 1.5, -2.5], yaw: -Math.PI / 2, size: 0.2 }, // bedroom east wall, faces -X
-  },
-};
+// The simulated house's map. In a real room the headset creates the map; here the
+// house frame plays that part.
+export const SIM_MAP = { worldId: 'sim-house', created: 0 };
 
-// Simulated camera nodes (true poses). Each one calibrates against a marker in its
-// room when it can see one; the kitchen door cam can't, so it stands in for a camera
-// that was placed using setup mode instead.
+// Simulated camera nodes (true poses). Each one calibrates by watching a simulated
+// headset wearer walk around its room.
 export const SIM_CAMERAS = [
   { id: 'sim-kitchen', name: 'Kitchen cam', room: 'B', pos: [-1.0, 2.3, -3.2], target: [-1.8, 0.8, -0.6], fov: 70, w: 1280, h: 720 },
   { id: 'sim-kitchen2', name: 'Kitchen door cam', room: 'B', pos: [-3.8, 2.3, -0.5], target: [-0.8, 0.5, -3.6], fov: 75, w: 1280, h: 720 },

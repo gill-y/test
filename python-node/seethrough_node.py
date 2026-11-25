@@ -6,6 +6,9 @@ camera (Intel RealSense). It detects objects with Ultralytics YOLO, works out wh
 they are in the shared world map, and sends only object positions to the relay.
 Raw video never leaves this machine (an optional small thumbnail aside).
 
+No markers: put on the headset (it is the map), start this node with --calibrate, and
+walk around in front of the camera for 15-30 seconds. The calibration is saved.
+
 Examples
   python seethrough_node.py --relay wss://192.168.1.20:8443/ws --room ABC12 --insecure --source 0 --calibrate
   python seethrough_node.py --relay wss://192.168.1.20:8443/ws --room ABC12 --insecure \
@@ -33,7 +36,6 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-MARKER_DICT = cv2.aruco.DICT_ARUCO_MIP_36h12  # same dictionary as the browser node and markers page
 SEND_HZ = 12
 CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0])
 
@@ -74,33 +76,18 @@ class Intrinsics:
         return Intrinsics(K, np.array(d.get("dist", [0, 0, 0, 0, 0]), dtype=np.float64), width, height)
 
 
-def marker_world_matrix(m: dict) -> np.ndarray:
-    yaw = m.get("yaw", 0.0)
-    c, s = math.cos(yaw), math.sin(yaw)
+def pose_msg_to_matrix(pose: dict) -> np.ndarray:
+    x, y, z, w = pose["q"]
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
     M = np.eye(4)
-    M[:3, :3] = [[c, 0, s], [0, 1, 0], [-s, 0, c]]
-    M[:3, 3] = m["p"]
+    M[:3, :3] = [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+    M[:3, 3] = pose["p"]
     return M
-
-
-def marker_object_points(size: float) -> np.ndarray:
-    h = size / 2
-    return np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], dtype=np.float64)
-
-
-def pose_from_corners(corners: np.ndarray, size: float, intr: Intrinsics):
-    """corners: 4x2 (TL, TR, BR, BL). Returns (gl_cam_from_marker 4x4, reprojection error px)."""
-    obj = marker_object_points(size)
-    ok, rvec, tvec = cv2.solvePnP(obj, corners.astype(np.float64), intr.K, intr.dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-    if not ok:
-        return None, None
-    proj, _ = cv2.projectPoints(obj, rvec, tvec, intr.K, intr.dist)
-    err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - corners, axis=1)))
-    R, _ = cv2.Rodrigues(rvec)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = tvec.ravel()
-    return CV_TO_GL @ T, err
 
 
 def matrix_to_pose_msg(M: np.ndarray) -> dict:
@@ -158,45 +145,283 @@ def detection_to_world(bbox, intr: Intrinsics, world_from_cam: np.ndarray, label
 
 
 # --------------------------------------------------------------------------- calibration
+#
+# No markers: the headset is the map. The camera calibrates by watching the headset
+# wearer walk around in front of it. The headset reports where the wearer's head is;
+# the camera sees their head and feet at the same moments. Mirrors js/common/walkcal.js
+# and solveCameraFromObservations() in js/common/geometry.js.
 
-class Calibrator:
-    def __init__(self, frames_needed: int = 30):
-        self.detector = cv2.aruco.ArucoDetector(
-            cv2.aruco.getPredefinedDictionary(MARKER_DICT), cv2.aruco.DetectorParameters()
-        )
-        self.frames_needed = frames_needed
-        self.reset()
+HEAD_TOP_ABOVE_EYES = 0.11  # top of the head above the headset (eyes), metres
+HEAD_TOP_BEHIND = 0.05  # box top edge = back of the head, seen from above
+FEET_IN_FRONT = 0.2  # box bottom edge = front of the nearer foot
+FEET_WEIGHT = 0.35  # the feet edge moves with every stride: trust it less
 
-    def reset(self):
-        self.frames: list[np.ndarray] = []
-        self.marker_id: str | None = None
 
-    def detect(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-        corners, ids, _ = self.detector.detectMarkers(gray)
-        if ids is None:
-            return []
-        if len(corners):
-            crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
-            for c in corners:
-                cv2.cornerSubPix(gray, c, (5, 5), (-1, -1), crit)
-        return [(str(int(i)), c.reshape(4, 2).astype(np.float64)) for c, i in zip(corners, ids.ravel())]
+class PositionHistory:
+    """Timestamped positions, for looking up where the headset was when a frame was taken."""
 
-    def feed(self, frame, map_markers: dict) -> str | None:
-        """Adds one frame. Returns the marker id once enough frames are collected."""
-        found = self.detect(frame)
-        usable = [(i, c) for i, c in found if not map_markers or i in map_markers]
-        if self.marker_id is not None:
-            usable = [(i, c) for i, c in usable if i == self.marker_id]
-        if not usable:
+    def __init__(self, max_age_ms: float = 20000):
+        self.max_age_ms = max_age_ms
+        self.items: list[tuple[float, list]] = []
+
+    def push(self, ts: float, p) -> None:
+        if self.items and ts <= self.items[-1][0]:
+            return
+        self.items.append((ts, list(p)))
+        while self.items and ts - self.items[0][0] > self.max_age_ms:
+            self.items.pop(0)
+
+    def at(self, ts: float, max_gap: float = 250):
+        a = self.items
+        if not a or ts < a[0][0] or ts > a[-1][0] + 60:
             return None
-        usable.sort(key=lambda ic: -cv2.contourArea(ic[1].astype(np.float32)))
-        self.marker_id, corners = usable[0]
-        self.frames.append(corners)
-        return self.marker_id if len(self.frames) >= self.frames_needed else None
+        if ts >= a[-1][0]:
+            return list(a[-1][1])
+        for i in range(len(a) - 1, 0, -1):
+            if a[i - 1][0] <= ts:
+                (t0, p0), (t1, p1) = a[i - 1], a[i]
+                if t1 - t0 > max_gap:
+                    return None
+                k = (ts - t0) / ((t1 - t0) or 1)
+                return [v0 + (v1 - v0) * k for v0, v1 in zip(p0, p1)]
+        return None
 
-    def mean_corners(self) -> np.ndarray:
-        return np.mean(np.stack(self.frames), axis=0)
+
+def _project(R, t, f, X, cx, cy):
+    Xc = X @ R.T + t
+    z = Xc[:, 2]
+    zs = np.where(z > 0.05, z, 1.0)
+    return cx + f * Xc[:, 0] / zs, cy + f * Xc[:, 1] / zs, z
+
+
+def _residuals(params, obs, cx, cy, f_prior, refine_focal):
+    R, _ = cv2.Rodrigues(params[:3])
+    f = f_prior * math.exp(params[6]) if refine_focal else params[6]
+    u, v, z = _project(R, params[3:6], f, obs["X"], cx, cy)
+    pred = np.where(obs["axis"] == 0, u, v)
+    r = (pred - obs["val"]) * obs["w"]
+    r = np.where(z > 0.05, r, 1e3)
+    if refine_focal:
+        r = np.append(r, params[6] * 60)  # weak pull towards the configured field of view
+    return r
+
+
+def _refine(R, t, f, obs, cx, cy, f_prior, refine_focal, max_iter=40):
+    rv, _ = cv2.Rodrigues(R)
+    params = np.concatenate([rv.ravel(), np.asarray(t, float), [math.log(f / f_prior) if refine_focal else f]])
+    n_p = 7 if refine_focal else 6
+    mu = 1e-3
+    r0 = _residuals(params, obs, cx, cy, f_prior, refine_focal)
+    e0 = float(r0 @ r0)
+    for _ in range(max_iter):
+        J = np.zeros((r0.size, n_p))
+        for j in range(n_p):
+            d = 1e-6 if j < 3 or j == 6 else 1e-6 * max(1.0, abs(params[j]))
+            p2 = params.copy()
+            p2[j] += d
+            J[:, j] = (_residuals(p2, obs, cx, cy, f_prior, refine_focal) - r0) / d
+        A = J.T @ J
+        A[np.diag_indices(n_p)] *= 1 + mu
+        A[np.diag_indices(n_p)] += 1e-9
+        try:
+            step = np.linalg.solve(A, -J.T @ r0)
+        except np.linalg.LinAlgError:
+            break
+        nxt = params.copy()
+        nxt[:n_p] += step
+        r1 = _residuals(nxt, obs, cx, cy, f_prior, refine_focal)
+        e1 = float(r1 @ r1)
+        if e1 < e0:
+            gain = e0 - e1
+            params, r0, e0 = nxt, r1, e1
+            mu = max(mu / 3, 1e-9)
+            if gain < 1e-9 * e0:
+                break
+        else:
+            mu *= 4
+            if mu > 1e8:
+                break
+    R, _ = cv2.Rodrigues(params[:3])
+    f = f_prior * math.exp(params[6]) if refine_focal else params[6]
+    return R, params[3:6].copy(), f
+
+
+def _obs_arrays(obs_list):
+    return {
+        "X": np.array([o["X"] for o in obs_list], float),
+        "axis": np.array([o["axis"] for o in obs_list]),
+        "val": np.array([o["val"] for o in obs_list], float),
+        "w": np.array([o.get("w", 1.0) for o in obs_list], float),
+        "g": np.array([o["g"] for o in obs_list]),
+    }
+
+
+def solve_camera(obs_list, intr: "Intrinsics", refine_focal=True):
+    """Camera pose from observations {X, axis (0 = u, 1 = v), val (px), w, g (frame)}.
+    Returns dict(world_from_cam (GL, 4x4), f, fov_h, error, inliers, total) or None."""
+    if len(obs_list) < 12:
+        return None
+    W = intr.width
+    cx, cy, f0 = intr.K[0, 2], intr.K[1, 2], intr.f
+    thr = max(12.0, W * 0.025)
+    obs = _obs_arrays(obs_list)
+    groups = [np.flatnonzero(obs["g"] == g) for g in np.unique(obs["g"])]
+    if len(groups) < 5:
+        return None
+
+    def frame_errors(R, t, f):
+        u, v, z = _project(R, t, f, obs["X"], cx, cy)
+        e = np.abs((np.where(obs["axis"] == 0, u, v) - obs["val"]) * obs["w"])
+        e = np.where(z > 0.05, e, 1e3)
+        return e, np.array([e[ids].max() for ids in groups])
+
+    def score(R, t, f):
+        return float(np.minimum(frame_errors(R, t, f)[1] ** 2, thr * thr).sum())
+
+    def subset(mask_groups):
+        ids = np.concatenate([groups[i] for i in mask_groups]) if len(mask_groups) else np.array([], int)
+        return {k: v[ids] for k, v in obs.items()}
+
+    centre = obs["X"].mean(axis=0)
+    step = max(1, math.ceil(len(groups) / 40))
+    sub = subset(list(range(0, len(groups), step)))
+    starts = []
+    target = np.array([centre[0], 0.9, centre[2]])
+    for a in range(16):
+        ang = a / 16 * 2 * math.pi
+        for d in (1.8, 3.2, 5.5):
+            for h in (0.8, 1.8, 2.6):
+                eye = np.array([centre[0] + math.sin(ang) * d, h, centre[2] + math.cos(ang) * d])
+                zax = eye - target
+                zax /= np.linalg.norm(zax)
+                xax = np.cross([0.0, 1.0, 0.0], zax)
+                xax /= np.linalg.norm(xax)
+                yax = np.cross(zax, xax)
+                Rgl = np.stack([xax, yax, zax], axis=1)  # world <- GL camera
+                Rcv = np.diag([1.0, -1.0, -1.0]) @ Rgl.T  # CV camera <- world
+                tcv = -Rcv @ eye
+                R, t, f = _refine(Rcv, tcv, f0, sub, cx, cy, f0, False, max_iter=12)
+                starts.append((score(R, t, f), R, t, f))
+    starts.sort(key=lambda s: s[0])
+    best = None
+    for _, R, t, f in starts[:4]:
+        ok = True
+        for rnd in range(4):
+            _, fe = frame_errors(R, t, f)
+            keep = [i for i, e in enumerate(fe) if e < thr * (1 if rnd else 2.5)]
+            sel = subset(keep)
+            if sel["X"].shape[0] < 12:
+                ok = False
+                break
+            R, t, f = _refine(R, t, f, sel, cx, cy, f0, refine_focal and sel["X"].shape[0] >= 40 and rnd > 0)
+        if ok:
+            sc = score(R, t, f)
+            if best is None or sc < best[0]:
+                best = (sc, R, t, f)
+    if best is None:
+        return None
+    _, R, t, f = best
+    e, fe = frame_errors(R, t, f)
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = R, t
+    world_from_cam = np.linalg.inv(CV_TO_GL @ T)
+    inl = e[e < thr]
+    return {
+        "world_from_cam": world_from_cam,
+        "f": f,
+        "fov_h": math.degrees(2 * math.atan(W / 2 / f)),
+        "error": float(np.median(inl)) if inl.size else float("inf"),
+        "inliers": int((fe < thr).sum()),
+        "total": len(groups),
+    }
+
+
+class WalkCalibrator:
+    """Collects (person box, headset position) pairs and solves for the camera pose."""
+
+    def __init__(self, intr: "Intrinsics", min_frames: int = 100, min_spread: float = 2.0, min_seconds: float = 12.0):
+        self.intr = intr
+        self.min_frames = min_frames
+        self.min_spread = min_spread
+        self.min_seconds = min_seconds
+        self.started = time.time()
+        self.obs: list[dict] = []
+        self.heads: list[tuple[float, float]] = []
+        self.us: list[float] = []
+        self.frames = 0
+
+    def add(self, bbox, head) -> bool:
+        x, y, w, h = bbox
+        W, H = self.intr.width, self.intr.height
+        cxb = x + w / 2
+        if cxb < 0 or cxb > W or w < 8 or h < 16:
+            return False
+        top = head[1] + HEAD_TOP_ABOVE_EYES
+        top_vis = y > 3
+        feet_vis = y + h < H - 3 and head[1] > 1.2
+        if not top_vis and not feet_vis:
+            return False
+        g = self.frames
+        if top_vis:
+            self.obs.append({"X": [head[0], top, head[2]], "axis": 1, "val": y, "g": g, "kind": "top"})
+        if feet_vis:
+            self.obs.append({"X": [head[0], 0.0, head[2]], "axis": 1, "val": y + h, "g": g, "kind": "feet", "w": FEET_WEIGHT})
+        if x > 3 and x + w < W - 3:
+            self.obs.append({"X": [head[0], top / 2, head[2]], "axis": 0, "val": cxb, "g": g})
+        self.frames += 1
+        self.heads.append((head[0], head[2]))
+        self.us.append(cxb / W)
+        return True
+
+    def progress(self) -> dict:
+        pts = np.array(self.heads) if self.heads else np.zeros((0, 2))
+        spread = float(np.max(np.linalg.norm(pts[:, None] - pts[None], axis=2))) if len(pts) > 1 else 0.0
+        width = float(math.sqrt(max(0.0, np.linalg.eigvalsh(np.cov(pts.T))[0]))) if len(pts) > 2 else 0.0
+        u_spread = (max(self.us) - min(self.us)) if self.us else 0.0
+        elapsed = time.time() - self.started
+        parts = [min(1, self.frames / self.min_frames), min(1, spread / self.min_spread), min(1, u_spread / 0.4), min(1, width / 0.35),
+                 min(1, elapsed / self.min_seconds) if self.min_seconds else 1]
+        hint = ""
+        if parts[1] < 1:
+            hint = "Walk around more: cover at least 2 m."
+        elif parts[3] < 1:
+            hint = "Walk towards the camera and away from it too, not just across."
+        elif parts[2] < 1:
+            hint = "Walk across the picture, from one side to the other."
+        return {"fraction": min(parts), "ready": min(parts) >= 1, "hint": hint}
+
+    def _corrected(self, cam_x, cam_z):
+        out = []
+        far = [o for o in self.obs if math.hypot(o["X"][0] - cam_x, o["X"][2] - cam_z) > 1.0]
+        for o in far if len(far) >= len(self.obs) * 0.5 else self.obs:
+            k = {"top": HEAD_TOP_BEHIND, "feet": -FEET_IN_FRONT}.get(o.get("kind"))
+            if k is None:
+                out.append(o)
+                continue
+            dx, dz = o["X"][0] - cam_x, o["X"][2] - cam_z
+            n = math.hypot(dx, dz) or 1.0
+            out.append({**o, "X": [o["X"][0] + dx / n * k, o["X"][1], o["X"][2] + dz / n * k]})
+        return out
+
+    def solve(self):
+        res = solve_camera(self.obs, self.intr)
+        for _ in range(2):
+            if not res:
+                break
+            c = res["world_from_cam"][:3, 3]
+            nxt = solve_camera(self._corrected(c[0], c[2]), self.intr)
+            if not nxt:
+                break
+            res = nxt
+        if not res:
+            return None
+        c = res["world_from_cam"][:3, 3]
+        mx, mz = np.mean(self.heads, axis=0)
+        res["ok"] = bool(
+            0.05 < c[1] < 4 and math.hypot(c[0] - mx, c[2] - mz) < 12
+            and res["inliers"] >= res["total"] * 0.6 and res["error"] <= max(12, self.intr.width * 0.025)
+        )
+        return res
 
 
 # --------------------------------------------------------------------------- tracking
@@ -348,7 +573,10 @@ class Node:
         self.id = args.id or f"py-{uuid.uuid5(uuid.NAMESPACE_DNS, args.name + args.source).hex[:8]}"
         self.state = NodeState()
         self.calib_path = args.calib_file or f"seethrough_calib_{self.id}_{args.room}.json"
-        self.calibrator = Calibrator() if args.calibrate else None
+        self.calibrating = bool(args.calibrate)
+        self.calibrator: WalkCalibrator | None = None
+        self.headsets: dict[str, PositionHistory] = {}  # headset id -> head positions (world, relay clock)
+        self._last_calib_log = 0.0
         self.capture = Capture(args.source, args.width, args.height, args.depth)
         self.intr = None
         self.model = None
@@ -380,25 +608,22 @@ class Node:
             return
         with open(self.calib_path) as fh:
             self.state.calib = json.load(fh)
-        log(f"Loaded calibration from {self.calib_path} (marker {self.state.calib['marker_id']}). "
-            "Use --calibrate if the camera has moved.")
+        log(f"Loaded calibration from {self.calib_path}. Use --calibrate if the camera has moved.")
 
-    def _recompute_pose(self):
+    def _apply_calibration(self):
         c = self.state.calib
-        if not c or not self.intr:
+        if not c:
             return
-        markers = (self.state.map or {}).get("markers") or {}
-        m = markers.get(c["marker_id"])
-        if not m:
+        world = (self.state.map or {}).get("worldId")
+        if world and c.get("worldId") != world:
+            if self.state.pose is not None or not getattr(self, "_warned_world", False):
+                log("This calibration belongs to an older map (the headset started a new one). Run again with --calibrate.")
+                self._warned_world = True
             self.state.pose = None
-            log(f"Marker {c['marker_id']} is not on this room's map; recalibrate with --calibrate.")
             return
-        T, err = pose_from_corners(np.array(c["corners"]), m.get("size", self.args.marker_size), self.intr)
-        if T is None:
-            return
-        self.state.pose = m_world = marker_world_matrix(m) @ np.linalg.inv(T)
-        p = m_world[:3, 3]
-        log(f"Camera pose: ({p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f}) m, reprojection error {err:.2f} px")
+        self.state.pose = pose_msg_to_matrix(c["pose"])
+        p = self.state.pose[:3, 3]
+        log(f"Camera pose: ({p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f}) m on the headset's map")
         self._send_camera()
 
     def _send(self, msg: dict):
@@ -418,7 +643,6 @@ class Node:
             "pose": matrix_to_pose_msg(self.state.pose) if self.state.pose is not None else None,
             "fovH": math.degrees(2 * math.atan(self.intr.width / 2 / self.intr.f)) if self.intr else self.args.fov,
             "aspect": (self.intr.width / self.intr.height) if self.intr else 16 / 9,
-            "calibratedWith": (self.state.calib or {}).get("marker_id"),
             "active": True,
         })
 
@@ -443,17 +667,17 @@ class Node:
                 time.sleep(0.003)
                 continue
             frame, depth = item
+            ts = self.now_ms()  # when this frame was taken, on the relay clock
             intr = self._intrinsics_for(frame)
-            if self.state.calib and self.state.pose is None and self.state.map is not None:
-                self._recompute_pose()
-
-            if self.calibrator is not None:
-                self._calibration_step(frame)
-                if self.args.show:
-                    self._show(frame, [])
-                continue
+            if self.state.calib and self.state.pose is None and self.state.map is not None and not self.calibrating:
+                self._apply_calibration()
 
             dets = self._detect(frame)
+            if self.calibrating:
+                self._calibration_step(dets, ts, intr)
+                if self.args.show:
+                    self._show(frame, dets)
+                continue
             objs = []
             if self.state.pose is not None:
                 for d in dets:
@@ -480,34 +704,68 @@ class Node:
             if self.args.show:
                 self._show(frame, dets)
 
-    def _calibration_step(self, frame):
-        markers = ((self.state.map or {}).get("markers")) or {}
-        done = self.calibrator.feed(frame, markers)
-        n = len(self.calibrator.frames)
-        if n and n % 5 == 0:
-            log(f"Calibrating on marker {self.calibrator.marker_id}: {n}/{self.calibrator.frames_needed}")
-        if not done:
+    def _active_headset(self):
+        now = self.now_ms()
+        best = None
+        for hid, h in self.headsets.items():
+            if h.items and now - h.items[-1][0] < 1500 and (best is None or h.items[-1][0] > best.items[-1][0]):
+                best = h
+        return best
+
+    def _calibration_step(self, dets, ts, intr):
+        """Walk calibration: pair the only person in view with where the headset says it is."""
+        now = time.time()
+        if self.calibrator is None:
+            if not (self.state.map or {}).get("worldId"):
+                if now - self._last_calib_log > 5:
+                    log("Waiting for the map: put on the headset and press Enter AR (the headset becomes the map).")
+                    self._last_calib_log = now
+                return
+            if self._active_headset() is None:
+                if now - self._last_calib_log > 5:
+                    log("Waiting for the headset's position: make sure it's in AR and on the map.")
+                    self._last_calib_log = now
+                return
+            self.calibrator = WalkCalibrator(intr)
+            log("Calibrating: walk slowly around in front of this camera wearing the headset, "
+                "crossing the picture, nearer and further. Only you should be in view.")
+        cal = self.calibrator
+        people = [d for d in dets if d["label"] == "person" and d["score"] >= 0.5]
+        hs = self._active_headset()
+        head = hs.at(ts) if hs else None
+        if len(people) == 1 and head:
+            cal.add(people[0]["bbox"], head)
+        prog = cal.progress()
+        if now - self._last_calib_log > 2:
+            log(f"Calibrating… {prog['fraction'] * 100:.0f}% ({cal.frames} frames). {prog['hint']}"
+                + (" More than one person in view." if len(people) > 1 else ""))
+            self._last_calib_log = now
+        if not prog["ready"] or cal.frames % 10:
             return
-        corners = self.calibrator.mean_corners()
-        jitter = float(np.max(np.linalg.norm(np.stack(self.calibrator.frames) - corners, axis=2)))
-        if jitter > 6:
-            log(f"Marker moved {jitter:.0f} px during calibration; keep the camera still. Retrying.")
-            self.calibrator.reset()
+        res = cal.solve()
+        if not res or not res["ok"]:
+            if cal.frames > cal.min_frames * 3:
+                log("Couldn't get a good fit. Check that only you are in view and the camera is still; starting over.")
+                self.calibrator = None
             return
-        mid = self.calibrator.marker_id
-        if not markers:
-            self.state.map = {"anchor": mid, "markers": {mid: {"p": [0, self.args.anchor_height, 0], "yaw": 0, "size": self.args.marker_size}}}
-            self._send({"t": "map", "map": self.state.map})
-            log(f"No map in this room yet: created one with marker {mid} as the anchor.")
-        size_px = float(np.mean([np.linalg.norm(corners[i] - corners[(i + 1) % 4]) for i in range(4)]))
-        if size_px < 60:
-            log(f"Warning: marker is only {size_px:.0f} px wide. Print it larger or move the camera closer for accuracy.")
-        self.state.calib = {"marker_id": mid, "corners": corners.tolist(), "width": frame.shape[1], "height": frame.shape[0], "at": time.time()}
+        self.state.calib = {
+            "worldId": self.state.map["worldId"],
+            "pose": matrix_to_pose_msg(res["world_from_cam"]),
+            "fovH": res["fov_h"],
+            "width": intr.width,
+            "height": intr.height,
+            "error": res["error"],
+            "at": time.time(),
+        }
+        # Use the refined field of view from now on.
+        self.intr = Intrinsics.from_fov(intr.width, intr.height, res["fov_h"]) if self.capture.factory_intrinsics is None and not self.args.intrinsics else intr
         with open(self.calib_path, "w") as fh:
             json.dump(self.state.calib, fh, indent=2)
-        log(f"Calibration saved to {self.calib_path}. Don't move the camera now.")
+        log(f"Calibrated from {cal.frames} frames (fit {res['error']:.1f} px, field of view {res['fov_h']:.1f}°). "
+            f"Saved to {self.calib_path}. Don't move the camera now.")
         self.calibrator = None
-        self._recompute_pose()
+        self.calibrating = False
+        self._apply_calibration()
 
     def _load_model(self):
         if self.model is None:
@@ -545,9 +803,8 @@ class Node:
             txt = f"{d['label']} {d['score']:.2f}" + (f" {d['world']['dist']:.1f} m" if d.get("world") else "")
             cv2.putText(vis, txt, (x, max(15, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         if self.calibrator is not None:
-            for mid, c in self.calibrator.detect(frame):
-                cv2.polylines(vis, [c.astype(np.int32)], True, (63, 210, 255), 2)
-                cv2.putText(vis, f"marker {mid}", tuple(c[0].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (63, 210, 255), 2)
+            prog = self.calibrator.progress()
+            cv2.putText(vis, f"Calibrating {prog['fraction'] * 100:.0f}%  {prog['hint']}", (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (63, 210, 255), 2)
         cv2.rectangle(vis, (0, 0), (vis.shape[1], 28), (28, 28, 185), -1)
         cv2.circle(vis, (16, 14), 7, (255, 255, 255), -1)
         cv2.putText(vis, f"CAMERA ACTIVE - {self.args.name}", (32, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -606,11 +863,16 @@ class Node:
                 self.state.offset_ms = msg["s"] - (msg["c"] + rtt / 2)
         elif t == "peer" and msg.get("joined"):
             self._send_camera()
+        elif t == "camera" and msg.get("kind") == "headset" and msg.get("id") != self.id:
+            self.headsets.setdefault(msg["id"], PositionHistory())
+        elif t == "pose" and msg.get("ts") and msg.get("pose"):
+            # Fast position updates come from the headset; remember them for walk calibration.
+            self.headsets.setdefault(msg["id"], PositionHistory()).push(msg["ts"], msg["pose"]["p"])
 
     def _set_map(self, m):
-        self.state.map = m or {}
-        if self.state.calib:
-            self._recompute_pose()
+        self.state.map = m if m and m.get("worldId") else {}
+        if self.state.calib and not self.calibrating:
+            self._apply_calibration()
 
     async def _pinger(self, ws):
         while True:
@@ -639,9 +901,7 @@ def parse_args(argv=None):
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--fov", type=float, default=65.0, help="Horizontal field of view in degrees (if no --intrinsics)")
     p.add_argument("--intrinsics", help="JSON with K/dist from cv2.calibrateCamera (more accurate than --fov)")
-    p.add_argument("--marker-size", type=float, default=0.15, help="Printed marker size in metres (black square)")
-    p.add_argument("--anchor-height", type=float, default=1.5, help="Marker centre height (m) if this camera creates the map")
-    p.add_argument("--calibrate", action="store_true", help="Calibrate against a marker before running")
+    p.add_argument("--calibrate", action="store_true", help="Calibrate by watching the headset wearer walk in front of the camera")
     p.add_argument("--calib-file", help="Where to store this camera's calibration")
     p.add_argument("--model", default="yolov8n.pt", help="Ultralytics model (yolov8n.pt, yolo11n.pt, ...)")
     p.add_argument("--imgsz", type=int, default=640)

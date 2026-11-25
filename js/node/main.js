@@ -12,13 +12,12 @@ import * as THREE from 'three';
 import { openLink } from '../common/transport.js';
 import {
   qs, randomId, randomRoomCode, normalizeRoom, defaultRelayUrl, safeGet, safeSet, safeGetJSON, safeSetJSON,
-  SEND_HZ, MARKER_DICTIONARY, colorForIndex, prettyLabel, FADE_END_S,
+  SEND_HZ, colorForIndex, prettyLabel, FADE_END_S,
 } from '../common/protocol.js';
 import {
-  intrinsicsFromFov, poseFromMarker, markerWorldMatrix, cameraWorldFromMarker, detectionToWorld,
-  poseToMsg, msgToPose, estimateFocal, fovFromFocal, averageCorners, markerPixelSize,
-  floorPose, projectBox,
+  intrinsicsFromFov, detectionToWorld, poseToMsg, msgToPose, floorPose, projectBox,
 } from '../common/geometry.js';
+import { WalkCalibrator, PositionHistory } from '../common/walkcal.js';
 import { Minimap } from '../common/minimap.js';
 import { Tracker } from '../common/tracker.js';
 import { CocoDetector } from './detector.js';
@@ -34,12 +33,12 @@ const st = {
   source: null, // {kind:'camera'|'synthetic', el, width, height, synthetic?}
   detector: null,
   tracker: new Tracker(),
-  calib: null, // {markerId, corners, size, fov, width, height, pose(Matrix4)}
+  calib: null, // {worldId, pose:{p,q}, fovH, width, height, error, at}
   K: null,
   pose: null, // Matrix4 world <- GL camera
   collecting: null,
   lastDets: [],
-  lastMarkers: [],
+  headsets: new Map(), // headset id -> PositionHistory of its head (world frame, relay clock)
   pendingObjs: null,
   lastTracked: [], // this node's own objects in world coordinates
   remote: { devices: new Map(), objects: new Map() }, // what the other devices report
@@ -53,7 +52,6 @@ $('room').value = room;
 $('relay').value = qs('relay') ?? defaultRelayUrl();
 $('name').value = safeGet('seethrough.nodeName') || defaultName();
 $('fov').value = safeGet('seethrough.nodeFov') || 65;
-$('msize').value = safeGet('seethrough.markerSizeCm') || 15;
 const color = colorForIndex(parseInt(st.id.slice(-2), 36) || 0);
 
 function defaultName() {
@@ -90,7 +88,7 @@ async function openSource() {
   const [w, h] = $('res').value.split('x').map(Number);
   if (choice === 'synthetic') {
     const { SyntheticSource } = await import('./synthetic.js');
-    const s = new SyntheticSource({ width: w, height: h, fov: Number($('fov').value), markerSize: Number($('msize').value) / 100, markerHeight: Number($('mheight').value) });
+    const s = new SyntheticSource({ width: w, height: h, fov: Number($('fov').value) });
     await s.ready;
     s.render(0);
     return { kind: 'synthetic', el: s.canvas, width: w, height: h, synthetic: s };
@@ -229,8 +227,17 @@ function onRemoteDevice(info) {
   st.remote.devices.set(info.id, d);
 }
 
+/** Remembers where each headset was, for walk calibration. */
+function recordHeadset(id, pose, ts) {
+  if (!pose || !ts) return;
+  let h = st.headsets.get(id);
+  if (!h) st.headsets.set(id, (h = new PositionHistory(20000)));
+  h.push(ts, pose.p);
+}
+
 function onRemotePose(m) {
   const d = st.remote.devices.get(m.id);
+  if (d?.info.kind === 'headset' || !d) recordHeadset(m.id, m.pose, m.ts);
   if (!d) return;
   d.info.pose = m.pose;
   d.matrix = msgToPose(m.pose);
@@ -284,8 +291,7 @@ function drawMinimap() {
     ...st.lastTracked.map((o) => ({ p: [o.p[0], o.p[2]], label: o.label, color, mine: true })),
     ...remoteObjects().map((o) => ({ p: [o.p[0], o.p[2]], label: o.label, color: o.color, mine: false })),
   ];
-  const markers = Object.entries(st.map?.markers || {}).map(([id, m]) => ({ id, p: [m.p[0], m.p[2]], yaw: m.yaw }));
-  minimap.draw({ self, devices, objects, markers, recording: st.running });
+  minimap.draw({ self, devices, objects, recording: st.running });
 }
 setInterval(drawMinimap, 100);
 $('show-map').onchange = () => {
@@ -302,11 +308,13 @@ function setStatus(status) {
 }
 
 function setMap(map) {
-  st.map = map;
-  $('height-row').hidden = !!(map && map.markers && Object.keys(map.markers).length);
-  // A recalibration elsewhere may have moved markers: recompute our pose from our
-  // stored marker view so we stay consistent with the shared map.
-  if (st.calib) recomputePose();
+  st.map = map && map.worldId ? map : null;
+  // The headset started a new map: this camera's old calibration no longer applies.
+  if (st.calib && st.map && st.calib.worldId !== st.map.worldId) {
+    st.pose = null;
+    renderCalib('The headset started a new map. Calibrate this camera again.');
+    announce();
+  } else if (st.calib && !st.pose) applyCalibration();
 }
 
 function announce() {
@@ -320,13 +328,16 @@ function announce() {
     pose: st.pose ? poseToMsg(st.pose) : null,
     fovH: Number($('fov').value),
     aspect: st.source ? st.source.width / st.source.height : 16 / 9,
-    calibratedWith: st.calib?.markerId ?? null,
     active: true,
   });
 }
 setInterval(announce, 4000);
 
 // ------------------------------------------------------------------ calibration
+//
+// No markers: the camera watches the headset wearer walk around in front of it. The
+// headset reports where its wearer's head is; the camera sees the wearer's head and
+// feet in its picture at the same moments; together they give the camera's pose.
 
 const calibKey = () => `seethrough.calib.${$('room').value}.${st.id}`;
 
@@ -338,45 +349,33 @@ function updateIntrinsics() {
 $('fov').onchange = () => {
   safeSet('seethrough.nodeFov', $('fov').value);
   updateIntrinsics();
-  if (st.calib) recomputePose();
-};
-$('msize').onchange = () => {
-  safeSet('seethrough.markerSizeCm', $('msize').value);
-  if (st.calib) recomputePose();
 };
 
 function loadCalibration() {
   const saved = safeGetJSON(calibKey());
-  if (saved && st.source && saved.width === st.source.width && saved.height === st.source.height) {
+  if (saved?.pose && st.source && saved.width === st.source.width && saved.height === st.source.height) {
     st.calib = saved;
-    recomputePose();
-    toast(`Loaded saved calibration (marker ${saved.markerId}). If this camera has moved, calibrate again.`);
+    applyCalibration();
+    if (st.pose) toast('Loaded saved calibration. If this camera has moved, calibrate again.');
   } else {
     renderCalib();
   }
 }
 
-/** Pose from the stored (averaged) marker view, the current FOV and the current map. */
-function recomputePose() {
+function applyCalibration() {
   const c = st.calib;
-  if (!c || !st.K) return;
-  const m = st.map?.markers?.[c.markerId];
-  if (!m) {
+  if (!c) return;
+  if (st.map && c.worldId !== st.map.worldId) {
     st.pose = null;
-    renderCalib(`Marker ${c.markerId} isn't on this room's map. Calibrate again on a marker that is.`);
-    announce();
+    renderCalib('This calibration belongs to an older map. Calibrate again.');
     return;
   }
-  const size = m.size || Number($('msize').value) / 100;
-  const pose = poseFromMarker(c.corners, size, st.K);
-  if (!pose) {
-    st.pose = null;
-    renderCalib('Could not compute a pose from the saved marker view.');
-    return;
+  st.pose = msgToPose(c.pose);
+  if (c.fovH) {
+    $('fov').value = c.fovH.toFixed(1);
+    safeSet('seethrough.nodeFov', $('fov').value);
+    updateIntrinsics();
   }
-  st.pose = cameraWorldFromMarker(markerWorldMatrix(m), pose.glCamFromMarker);
-  c.error = pose.error;
-  c.distance = pose.distance;
   renderCalib();
   announce();
 }
@@ -392,15 +391,12 @@ function renderCalib(problem) {
   }
   if (!c || !st.pose) {
     el.className = 'calib-state warn';
-    el.textContent = 'Not calibrated: objects are detected but not sent.';
+    el.textContent = 'Not calibrated: objects are detected but not shared.';
     return;
   }
   const p = new THREE.Vector3().setFromMatrixPosition(st.pose);
-  const small = c.pixelSize < 60;
-  el.className = `calib-state ${small ? 'warn' : 'ok'}`;
-  el.textContent =
-    `Calibrated on marker ${c.markerId}: ${c.distance.toFixed(2)} m away, camera at (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) m.` +
-    (small ? ` The marker was only ${Math.round(c.pixelSize)} px wide; print it larger or move closer for better accuracy.` : '');
+  el.className = 'calib-state ok';
+  el.textContent = `Calibrated: camera at (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) m on the headset's map, field of view ${c.fovH.toFixed(1)}°, fit ${c.error.toFixed(1)} px.`;
 }
 
 $('clear-calib').onclick = () => {
@@ -411,138 +407,81 @@ $('clear-calib').onclick = () => {
   announce();
 };
 
-$('calibrate').onclick = () => {
-  st.collecting = { frames: [], focal: [], markerId: null, lastGood: performance.now() };
-  $('calibrate').disabled = true;
-  $('calib-progress').style.width = '0%';
-  renderCalib('Hold still… looking for a marker.');
-};
-
-$('use-fov').onclick = () => {
-  const f = Number($('use-fov').dataset.fov);
-  if (!f) return;
-  $('fov').value = f.toFixed(1);
-  $('fov').onchange();
-  $('use-fov').hidden = true;
-  toast(`Field of view set to ${f.toFixed(1)}°.`);
-};
-
-const arDetector = new window.AR.Detector({ dictionaryName: MARKER_DICTIONARY, maxHammingDistance: 3 });
-const work = document.createElement('canvas');
-const workCtx = work.getContext('2d', { willReadFrequently: true });
-
-function detectMarkers() {
-  const { width, height, el } = st.source;
-  work.width = width;
-  work.height = height;
-  workCtx.drawImage(el, 0, 0, width, height);
-  const image = workCtx.getImageData(0, 0, width, height);
-  // Ignore tiny false positives from texture: a real marker spans at least ~16 px.
-  const found = arDetector.detect(image).filter((m) => markerPixelSize(m.corners) > 16);
-
-  // js-aruco2 finds the square outline of small markers (under ~60 px) but often
-  // can't read their bits. Re-run on an upscaled crop around each unread outline
-  // and map the corners back to full-image pixels.
-  for (const cand of arDetector.candidates.slice(0, 8)) {
-    const xs = cand.map((p) => p.x);
-    const ys = cand.map((p) => p.y);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    const size = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
-    if (size < 16 || size > 140) continue;
-    if (found.some((m) => Math.hypot(m.corners[0].x - cand[0].x, m.corners[0].y - cand[0].y) < size)) continue;
-    const half = size * 0.9;
-    const scale = Math.min(4, Math.max(1.5, 160 / size));
-    const sx = Math.max(0, cx - half);
-    const sy = Math.max(0, cy - half);
-    const sw = Math.min(width - sx, half * 2);
-    const sh = Math.min(height - sy, half * 2);
-    zoom.width = Math.round(sw * scale);
-    zoom.height = Math.round(sh * scale);
-    zoomCtx.imageSmoothingEnabled = true;
-    zoomCtx.drawImage(work, sx, sy, sw, sh, 0, 0, zoom.width, zoom.height);
-    const sub = zoomDetector.detect(zoomCtx.getImageData(0, 0, zoom.width, zoom.height));
-    for (const m of sub) {
-      found.push({ id: m.id, corners: m.corners.map((p) => ({ x: sx + p.x / scale, y: sy + p.y / scale })) });
-    }
+/** The headset whose position to calibrate against: one that reported recently. */
+function activeHeadset() {
+  const now = st.link?.now() ?? Date.now();
+  let best = null;
+  for (const [id, h] of st.headsets) {
+    const last = h.items[h.items.length - 1];
+    if (last && now - last.ts < 1500 && (!best || last.ts > best.ts)) best = { id, ts: last.ts, history: h };
   }
-  return found;
+  return best;
 }
-const zoom = document.createElement('canvas');
-const zoomCtx = zoom.getContext('2d', { willReadFrequently: true });
-const zoomDetector = new window.AR.Detector({ dictionaryName: MARKER_DICTIONARY, maxHammingDistance: 3 });
 
-function collectCalibration() {
-  const col = st.collecting;
-  const markers = detectMarkers();
-  st.lastMarkers = markers;
-  const known = st.map?.markers || {};
-  const mapEmpty = !Object.keys(known).length;
-  // Use the biggest marker that's on the map (or, with no map yet, the biggest marker).
-  const usable = markers
-    .filter((m) => mapEmpty || known[String(m.id)])
-    .filter((m) => col.markerId === null || String(m.id) === col.markerId)
-    .sort((a, b) => markerPixelSize(b.corners) - markerPixelSize(a.corners));
-  const sinceGood = performance.now() - col.lastGood;
-  if (!usable.length) {
-    if (markers.length && !mapEmpty) {
-      renderCalib(`Seeing marker ${markers.map((m) => m.id).join(', ')}, but it isn't on this room's map. Link it with the headset's "Map rooms" mode, or point at marker ${Object.keys(known).join(', ')}.`);
-    }
-    if (sinceGood > 15000) {
-      st.collecting = null;
-      $('calibrate').disabled = false;
-      renderCalib(markers.length ? 'Calibration stopped: no usable marker.' : 'No marker found. Make sure a printed marker is in view and well lit.');
-    }
+$('calibrate').onclick = () => {
+  if (st.collecting) {
+    stopCollecting('Calibration cancelled.');
     return;
   }
-  const m = usable[0];
-  col.lastGood = performance.now();
-  col.markerId = String(m.id);
-  col.frames.push(m.corners.map((c) => ({ x: c.x, y: c.y })));
-  const f = estimateFocal(m.corners, 1, st.source.width / 2, st.source.height / 2);
-  if (f) col.focal.push(f);
-  $('calib-progress').style.width = `${(col.frames.length / 30) * 100}%`;
-  renderCalib(`Calibrating on marker ${m.id}… ${col.frames.length}/30`);
-  if (col.frames.length < 30) return;
+  updateIntrinsics();
+  if (st.source.kind !== 'synthetic') {
+    if (!st.map) {
+      renderCalib('No map yet. Put on the headset and press Enter AR: the headset becomes the map. Then calibrate here.');
+      return;
+    }
+    if (!activeHeadset()) {
+      renderCalib("Can't see the headset's position. Put it on, make sure it's in AR and on the map (its panel says so), then try again.");
+      return;
+    }
+  }
+  st.collecting = new WalkCalibrator(st.K);
+  $('calibrate').textContent = 'Cancel';
+  $('calib-progress').style.width = '0%';
+  renderCalib('Calibrating: walk slowly around in front of this camera wearing the headset, crossing the picture from side to side. Only you should be in view.');
+};
 
-  // Done: average the corners, then solve.
+function stopCollecting(message) {
   st.collecting = null;
-  $('calibrate').disabled = false;
-  const corners = averageCorners(col.frames);
-  const pixelSize = markerPixelSize(corners);
-  // Reject a calibration where the camera moved during capture.
-  const jitter = Math.max(...col.frames.map((fr) => Math.max(...fr.map((c, i) => Math.hypot(c.x - corners[i].x, c.y - corners[i].y)))));
-  if (jitter > 6) {
-    renderCalib(`The marker moved ${jitter.toFixed(0)} px during calibration. Keep the camera completely still and try again.`);
+  $('calibrate').textContent = 'Calibrate';
+  if (message) renderCalib(message);
+}
+
+/** One frame of walk calibration: the only person in view, paired with the headset's position then. */
+function collectCalibration(dets, ts) {
+  const cal = st.collecting;
+  const people = dets.filter((d) => d.label === 'person' && d.score >= 0.5);
+  let head = null;
+  if (st.source.kind === 'synthetic') head = st.source.synthetic.headAt(ts);
+  else head = activeHeadset()?.history.at(ts);
+  if (people.length === 1 && head) cal.add(people[0].bbox, head);
+  const prog = cal.progress();
+  $('calib-progress').style.width = `${Math.round(prog.fraction * 100)}%`;
+  if (people.length > 1) renderCalib('More than one person in view: only the headset wearer should be in the picture.');
+  else if (!head) renderCalib("Waiting for the headset's position… make sure it's in AR and on the map.");
+  else renderCalib(`Calibrating… ${Math.round(prog.fraction * 100)}%. ${prog.hint}`);
+  if (prog.timedOut) {
+    stopCollecting('Calibration timed out. Walk around more, across the whole picture, and make sure the camera sees your head and feet.');
     return;
   }
-
-  if (mapEmpty) {
-    // First marker in this room: it becomes the anchor of a new map.
-    const size = Number($('msize').value) / 100;
-    const h = Number($('mheight').value);
-    const map = { anchor: col.markerId, markers: { [col.markerId]: { p: [0, h, 0], yaw: 0, size } } };
-    st.map = map;
-    st.link?.send({ t: 'map', map });
-    toast(`Created a new map with marker ${col.markerId} as the anchor.`);
+  if (!prog.ready || cal.frames % 10 !== 0) return;
+  const res = cal.solve();
+  if (!res?.ok) {
+    if (cal.frames > cal.minFrames * 3) stopCollecting(`Couldn't get a good fit (${res ? `${res.error.toFixed(0)} px` : 'no solution'}). Check that only you are in view and that the camera stays still, then try again.`);
+    return;
   }
-
-  st.calib = { markerId: col.markerId, corners, pixelSize, width: st.source.width, height: st.source.height, at: Date.now() };
+  st.calib = {
+    worldId: st.map?.worldId ?? 'synthetic',
+    pose: poseToMsg(res.worldFromCam),
+    fovH: res.fovH,
+    width: st.source.width,
+    height: st.source.height,
+    error: res.error,
+    at: Date.now(),
+  };
   safeSetJSON(calibKey(), st.calib);
-  recomputePose();
-
-  // Offer a better FOV if the marker was seen at an angle and it disagrees with the setting.
-  if (col.focal.length > 10) {
-    const sorted = col.focal.sort((a, b) => a - b);
-    const fMed = sorted[Math.floor(sorted.length / 2)];
-    const fovEst = fovFromFocal(fMed, st.source.width);
-    const spread = (sorted[Math.floor(sorted.length * 0.8)] - sorted[Math.floor(sorted.length * 0.2)]) / fMed;
-    if (spread < 0.08 && Math.abs(fovEst - Number($('fov').value)) > 2 && fovEst > 30 && fovEst < 130) {
-      $('use-fov').hidden = false;
-      $('use-fov').dataset.fov = fovEst;
-      $('use-fov').textContent = `Use estimated FOV (${fovEst.toFixed(1)}°)`;
-    }
-  }
+  stopCollecting();
+  applyCalibration();
+  toast(`Calibrated from ${cal.frames} frames of you walking (fit ${res.error.toFixed(1)} px).`);
 }
 
 // ------------------------------------------------------------------ main loop
@@ -550,7 +489,6 @@ function collectCalibration() {
 let lastSend = 0;
 let lastThumb = 0;
 let lastFrame = performance.now();
-let markerCheck = 0;
 
 async function loop() {
   if (!st.running) return;
@@ -558,13 +496,6 @@ async function loop() {
   const dt = (now - lastFrame) / 1000;
   lastFrame = now;
   if (st.source.kind === 'synthetic') st.source.synthetic.render(dt);
-
-  if (st.collecting) collectCalibration();
-  else if (now - markerCheck > 2000) {
-    // Occasional marker check, just to draw it on the preview.
-    markerCheck = now;
-    st.lastMarkers = detectMarkers();
-  }
 
   if (!st.busy) {
     st.busy = true;
@@ -589,11 +520,14 @@ async function loop() {
 
 async function detectObjects() {
   let dets;
+  // When the frame was taken, on the relay clock: matched to the headset's position for calibration.
+  const ts = st.link ? st.link.now() : Date.now();
   if (st.source.kind === 'synthetic') dets = st.source.synthetic.detect();
   else if (st.detector?.model) dets = await st.detector.detect(st.source.el, 20, Number($('minconf').value));
   else return;
   st.counters.det++;
   st.lastDets = dets;
+  if (st.collecting) collectCalibration(dets, ts);
   if (!st.pose || !st.K) {
     st.lastTracked = [];
     return;
@@ -652,15 +586,6 @@ function drawOverlay() {
     }
     g.setLineDash([]);
   }
-  for (const m of st.lastMarkers) {
-    g.strokeStyle = '#ffd23f';
-    g.beginPath();
-    m.corners.forEach((c, i) => (i ? g.lineTo(c.x, c.y) : g.moveTo(c.x, c.y)));
-    g.closePath();
-    g.stroke();
-    g.fillStyle = '#ffd23f';
-    g.fillText(`marker ${m.id}`, m.corners[0].x, m.corners[0].y - 8);
-  }
 }
 
 setInterval(() => {
@@ -686,8 +611,7 @@ addEventListener('pagehide', () => st.link?.send({ t: 'cameraGone', id: st.id })
 listSources();
 renderCalib();
 window.seethroughNode = st;
-// Test hook: advance the synthetic scene one step and run calibration on it.
+// Test hook: advance the synthetic scene one step.
 st.debugStep = (dt = 1 / 30) => {
   st.source.synthetic?.render(dt);
-  if (st.collecting) collectCalibration();
 };

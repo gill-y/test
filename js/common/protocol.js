@@ -6,21 +6,22 @@
 //   ping/pong  {t:'ping', c} -> {t:'pong', c, s}        (clock sync)
 //   camera     {t, id, name, color, kind, pose:{p:[x,y,z], q:[x,y,z,w]}|null, fovH, active}
 //              kind 'headset' is the headset itself: it is a device that detects too.
-//   pose       {t, id, pose:{p, q}}  fast position updates for a moving device (headset), ~10 Hz
+//   pose       {t, id, ts, pose:{p, q}}  fast position updates from the headset, ~10 Hz;
+//              ts (relay clock) lets cameras match them to their frames for calibration
 //   cameraGone {t, id}
 //   objects    {t, cam, ts, objs:[{id, label, p:[x,y,z], s:[w,h,d], c, kind}]}
 //              ts is in relay-clock milliseconds; p is the object's centre in world metres.
 //              Sent by phones, Python nodes and the headset alike; every device shows
 //              everyone else's detections (positions only, never video).
 //   thumb      {t, cam, img:'data:image/jpeg;base64,...'}
-//   map        {t, map:{markers:{[id]:{p:[x,y,z], yaw, size}}, anchor, updated}}
+//   map        {t, map:{worldId, created, updated}}  the room's shared world. A headset
+//              creates it; cameras calibrated against an older worldId must calibrate again.
 //
-// World frame: metres, +Y up, floor at y = 0. The origin is on the floor directly
-// below the anchor marker; +Z points out of the anchor marker's wall.
+// World frame: metres, +Y up, floor at y = 0. No markers: it is the floor-level tracking
+// space of the headset that created the map, kept between sessions with a persistent
+// anchor. Cameras find their place in it by watching the headset wearer walk.
 
 export const PROTOCOL_VERSION = 1;
-export const DEFAULT_MARKER_SIZE = 0.15; // metres, black square edge to edge
-export const MARKER_DICTIONARY = 'ARUCO_MIP_36h12';
 export const SEND_HZ = 12;
 export const POSE_HZ = 10;
 export const FADE_START_S = 1.0;
