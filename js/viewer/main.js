@@ -335,6 +335,8 @@ function onObjects(msg) {
     }
     rec.lastUpdate = now;
     rec.color = c.info.color;
+    rec.s = o.s;
+    rec.from = c.info.name || msg.cam;
     rec.conf = o.c ?? 0.5;
     rec.p = o.p;
     rec.visual.setTarget(o.p, o.s);
@@ -601,6 +603,12 @@ async function startSim() {
   }
   simHouse.visible = !renderer.xr.isPresenting;
   $('truth-row').hidden = false;
+  $('pv-row').hidden = false;
+  const { PhoneView } = await import('../sim/phone-view.js');
+  phoneView = new PhoneView($('pv-canvas'));
+  $('pv-cam').innerHTML = '';
+  for (const c of state.sim.cameras) $('pv-cam').append(new Option(c.def.name, c.id));
+  showPhoneView($('t-pv').checked);
   $('sim-toggle').textContent = 'Stop simulator';
   $('sim-toggle').setAttribute('aria-pressed', 'true');
   const errs = state.sim.stats().map((s) => `${s.name}: ${(s.errorM * 100).toFixed(0)} cm`).join(' · ');
@@ -614,6 +622,8 @@ function stopSim() {
   state.sim = null;
   if (simHouse) simHouse.visible = false;
   $('truth-row').hidden = true;
+  $('pv-row').hidden = true;
+  showPhoneView(false);
   state.showTruth = false;
   $('t-truth').checked = false;
   $('sim-toggle').textContent = 'Start simulator';
@@ -621,6 +631,33 @@ function stopSim() {
 }
 
 $('sim-toggle').onclick = () => (state.sim ? stopSim() : startSim());
+
+// Phone view: what the chosen simulated camera's node page would show.
+let phoneView = null;
+function showPhoneView(on) {
+  $('phone-view').hidden = !on || !state.sim || renderer.xr.isPresenting;
+}
+$('t-pv').onchange = (e) => showPhoneView(e.target.checked);
+
+function drawPhoneView(now) {
+  if (!phoneView || $('phone-view').hidden) return;
+  const cam = state.sim?.cameras.find((c) => c.id === $('pv-cam').value);
+  if (!cam) return;
+  const remote = [];
+  for (const o of state.objects.values()) {
+    if (o.cam === cam.id || !o.s || (now - o.lastUpdate) / 1000 > FADE_START_S || state.hiddenLabels.has(o.label)) continue;
+    // One outline per thing: skip copies another camera already reports.
+    if (o.dupOf && o.dupOf.cam !== cam.id) continue;
+    remote.push({ p: o.p, s: o.s, label: o.label, color: o.color, from: o.from });
+  }
+  const devices = [];
+  for (const c of state.cameras.values()) {
+    if (c.info.id === cam.id || !c.matrix) continue;
+    devices.push({ ...floorPose(c.matrix), color: c.info.color, name: c.info.name, kind: c.info.kind === 'headset' ? 'headset' : 'camera', fovH: c.info.fovH });
+  }
+  if (state.selfPose) devices.push({ ...floorPose(state.selfPose), color: HEADSET_COLOR, name: 'You (desktop)', kind: 'headset' });
+  phoneView.draw(cam, { remote, devices });
+}
 
 // ------------------------------------------------------------------ WebXR + the shared world
 //
@@ -871,6 +908,7 @@ renderer.xr.addEventListener('sessionstart', () => {
   $('hud').hidden = true;
   $('hint').hidden = true;
   miniCanvas.hidden = true;
+  showPhoneView(false);
   setUpWorld(renderer.xr.getSession());
   setTimeout(placePanel, 300);
 });
@@ -882,6 +920,7 @@ renderer.xr.addEventListener('sessionend', () => {
   $('hud').hidden = false;
   $('hint').hidden = false;
   miniCanvas.hidden = !state.showMinimap;
+  showPhoneView($('t-pv').checked);
   miniXRMesh.visible = false;
   stopHeadsetCamera();
   state.selfPose = null;
@@ -1015,16 +1054,19 @@ renderer.setAnimationLoop((t, frame) => {
     rateTimer = now;
   }
   miniTimer += dt;
-  if (state.showMinimap && miniTimer > 1 / 15) {
+  if (miniTimer > 1 / 15) {
     miniTimer = 0;
-    const data = minimapData(now);
-    if (xr) {
-      miniXR.draw(data);
-      miniXRTexture.needsUpdate = true;
-    } else if (!miniCanvas.hidden) {
-      sizeMiniCanvas();
-      miniDesktop.draw(data);
+    if (state.showMinimap) {
+      const data = minimapData(now);
+      if (xr) {
+        miniXR.draw(data);
+        miniXRTexture.needsUpdate = true;
+      } else if (!miniCanvas.hidden) {
+        sizeMiniCanvas();
+        miniDesktop.draw(data);
+      }
     }
+    if (!xr) drawPhoneView(now);
   }
   hudTimer += dt;
   if (hudTimer > 0.25 && !xr) {

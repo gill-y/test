@@ -8,14 +8,17 @@
 //      adds noise and dropouts, and then converts those boxes back to 3D with the
 //      same floor-projection code, using its *estimated* pose.
 //   3. Tracks and publishes objects over the link, at ~12 Hz, like a real node.
+// There is also a simulated headset wearer walking through the house. The cameras see
+// them like anyone else, and the headset shares its position and what it sees (as a
+// real headset does with its camera on), so the two-way sharing shows in the demo.
 // So what the viewer shows includes realistic calibration and projection error.
 
 import * as THREE from 'three';
-import { ROOMS, SIM_CAMERAS, SIM_MAP, SIM_OBJECTS, roomAt } from './world.js';
+import { ROOMS, SIM_CAMERAS, SIM_MAP, SIM_OBJECTS, SIM_HEADSET_WALK, roomAt } from './world.js';
 import { intrinsicsFromFov, detectionToWorld, poseToMsg, verticalFov } from '../common/geometry.js';
 import { WalkCalibrator, HEAD_TOP_ABOVE_EYES } from '../common/walkcal.js';
 import { Tracker } from '../common/tracker.js';
-import { SEND_HZ, colorForIndex } from '../common/protocol.js';
+import { SEND_HZ, colorForIndex, HEADSET_COLOR } from '../common/protocol.js';
 
 function gauss() {
   // Box-Muller
@@ -35,6 +38,7 @@ class Mover {
     this.seg = 0;
     this.t = (i * 0.37) % 1;
     this.pos = new THREE.Vector3(def.path[0][0], def.size[1] / 2, def.path[0][1]);
+    this.dir = new THREE.Vector3(0, 0, -1); // walking direction on the floor
   }
   step(dt) {
     if (this.path.length < 2 || !this.speed) return;
@@ -56,6 +60,55 @@ class Mover {
     const a = this.path[this.seg];
     const b = this.path[(this.seg + 1) % this.path.length];
     this.pos.set(a[0] + (b[0] - a[0]) * this.t, this.size[1] / 2, a[1] + (b[1] - a[1]) * this.t);
+    const d = new THREE.Vector3(b[0] - a[0], 0, b[1] - a[1]);
+    if (d.lengthSq() > 1e-9) this.dir.lerp(d.normalize(), 0.15).normalize(); // turn smoothly at corners
+  }
+}
+
+/**
+ * A simulated headset wearer. The cameras detect them as a person; the headset itself
+ * reports its position (10 Hz, like a real one on the map) and what it sees in front
+ * of it in the same room (like a real headset with its camera on, with ~12 cm error).
+ */
+class SimHeadset {
+  constructor(link, mover) {
+    this.id = 'sim-headset';
+    this.name = 'Simulated headset';
+    this.link = link;
+    this.mover = mover;
+    this.tracker = new Tracker({ prefix: 'sh-' });
+    this.eye = 1.6;
+  }
+
+  pose() {
+    const p = this.mover.pos;
+    const yaw = Math.atan2(-this.mover.dir.x, -this.mover.dir.z); // GL camera looks down -Z
+    return new THREE.Matrix4().compose(
+      new THREE.Vector3(p.x, this.eye, p.z),
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw),
+      new THREE.Vector3(1, 1, 1)
+    );
+  }
+
+  announce() {
+    this.link.send({ t: 'camera', id: this.id, name: this.name, color: HEADSET_COLOR, kind: 'headset', pose: poseToMsg(this.pose()), fovH: 80, aspect: 4 / 3, detecting: true, active: true });
+  }
+
+  tick(movers, now) {
+    this.link.send({ t: 'pose', id: this.id, ts: this.link.now(), pose: poseToMsg(this.pose()) });
+    const me = this.mover.pos;
+    const room = roomAt(me.x, me.z);
+    const dets = [];
+    for (const m of movers) {
+      if (m === this.mover || !room || roomAt(m.pos.x, m.pos.z)?.id !== room.id) continue;
+      const to = new THREE.Vector3(m.pos.x - me.x, 0, m.pos.z - me.z);
+      const dist = to.length();
+      if (dist < 0.3 || dist > 7 || to.normalize().angleTo(this.mover.dir) > THREE.MathUtils.degToRad(40)) continue;
+      if (Math.random() < 0.05) continue; // missed detection
+      dets.push({ label: m.label, p: [m.pos.x + gauss() * 0.12, m.pos.y, m.pos.z + gauss() * 0.12], s: m.size.slice(), c: 0.8 });
+    }
+    this.lastObjs = this.tracker.update(dets, now);
+    this.link.send({ t: 'objects', cam: this.id, ts: this.link.now(), objs: this.lastObjs });
   }
 }
 
@@ -231,6 +284,7 @@ class SimCamera {
       if (w) dets3d.push({ label: d.label, p: w.p, s: w.s, c: d.score });
     }
     const objs = this.tracker.update(dets3d, now);
+    this.lastObjs = objs;
     this.link.send({ t: 'objects', cam: this.id, ts: this.link.now(), objs });
   }
 
@@ -285,6 +339,9 @@ export class Simulator {
     this.link = link;
     this.publishMap = publishMap;
     this.movers = SIM_OBJECTS.map((d, i) => new Mover(d, i));
+    // The headset wearer: one more person in the house, seen by the cameras.
+    this.headsetMover = new Mover(SIM_HEADSET_WALK, 0);
+    this.movers.push(this.headsetMover);
     this.cameras = [];
     this.running = false;
     this.rooms = ROOMS;
@@ -296,11 +353,16 @@ export class Simulator {
     // The simulated house is its own map (its frame is the "headset" frame).
     if (this.publishMap) this.link.send({ t: 'map', map: SIM_MAP });
     this.cameras = SIM_CAMERAS.map((d, i) => new SimCamera(d, i, this.link));
-    for (const c of this.cameras) c.announce();
+    this.headset = new SimHeadset(this.link, this.headsetMover);
+    const announceAll = () => {
+      for (const c of this.cameras) c.announce();
+      this.headset.announce();
+    };
+    announceAll();
     this._offPeer = this.link.on('peer', (m) => {
       if (m.joined) {
         if (this.publishMap) this.link.send({ t: 'map', map: SIM_MAP });
-        for (const c of this.cameras) c.announce();
+        announceAll();
       }
     });
     let last = performance.now();
@@ -313,10 +375,9 @@ export class Simulator {
     this._send = setInterval(() => {
       const now = performance.now();
       for (const c of this.cameras) c.tick(this.movers, now);
+      this.headset.tick(this.movers, now);
     }, 1000 / SEND_HZ);
-    this._announce = setInterval(() => {
-      for (const c of this.cameras) c.announce();
-    }, 4000);
+    this._announce = setInterval(announceAll, 4000);
     this._thumbs = setInterval(() => {
       for (const c of this.cameras) c.thumbnail();
     }, 1500);
@@ -330,6 +391,7 @@ export class Simulator {
     clearInterval(this._thumbs);
     if (this._offPeer) this._offPeer();
     for (const c of this.cameras) this.link.send({ t: 'cameraGone', id: c.id });
+    if (this.headset) this.link.send({ t: 'cameraGone', id: this.headset.id });
   }
 
   /** Calibration error per camera, for display. */

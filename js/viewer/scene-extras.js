@@ -18,13 +18,15 @@ export class CameraVisuals {
       this.group.add(it.group);
       this.items.set(cam.id, it);
     }
-    const key = `${cam.color}|${cam.fovH}|${cam.aspect}|${cam.name}`;
+    const key = `${cam.color}|${cam.fovH}|${cam.aspect}|${cam.name}|${cam.kind}`;
     if (it.key !== key) {
       it.key = key;
       it.group.clear();
       const fov = THREE.MathUtils.degToRad(cam.fovH || 65);
       const aspect = cam.aspect || 16 / 9;
-      const d = 0.35;
+      // A headset is drawn smaller than a camera: it walks right up to you.
+      const small = cam.kind === 'headset';
+      const d = small ? 0.18 : 0.35;
       const hw = Math.tan(fov / 2) * d;
       const hh = hw / aspect;
       const o = new THREE.Vector3();
@@ -51,8 +53,9 @@ export class CameraVisuals {
       body.position.z = 0.03;
       const label = new LabelSprite(cam.color);
       label.setText(`● ${cam.name || cam.id}`);
-      label.sprite.scale.set(0.1 * label.aspect, 0.1, 1);
-      label.sprite.position.set(0, 0.16, 0);
+      const ls = small ? 0.05 : 0.1;
+      label.sprite.scale.set(ls * label.aspect, ls, 1);
+      label.sprite.position.set(0, small ? 0.1 : 0.16, 0);
       it.label = label;
       it.group.add(lines, up, body, label.sprite);
       it.group.traverse((x) => (x.renderOrder = 950));

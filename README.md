@@ -38,9 +38,85 @@ node server/server.js --http
 
 Then open http://localhost:8080/viewer.html?sim=1.
 
-You're standing in the living room. Three simulated cameras watch the kitchen and bedroom behind the wall. Walk with **W A S D** and drag to look. Switch to **Overview** to see the whole house, and turn on **Ground truth** to compare the reported outlines with where the objects really are. The simulated cameras calibrate the way real ones do: a simulated headset wearer walks around each room and the same calibration code solves each camera's pose, so what you see includes realistic error (typically 10–40 cm in camera position; about 10–30 cm in object position from floor projection). The toast at start shows each camera's error.
+You're standing in the living room. Three simulated phones watch the kitchen and bedroom behind the wall, and a **simulated headset wearer** walks from the kitchen into the bedroom and back through the house. Walk with **W A S D** and drag to look. Switch to **Overview** to see the whole house, and turn on **Ground truth** to compare the reported outlines with where things really are.
 
-## Real hardware setup
+What the simulator shows:
+
+- **Two-way sharing.** The phones see the headset wearer like anyone else, and the simulated headset shares its own position and what it sees in front of it (as a real headset does with its camera on). Everything shows up as outlines in your view and on the mini map (top left).
+- **What a phone shows.** The **phone view** panel (bottom left) draws exactly what a chosen phone's camera page would show: its own detections as solid boxes, what the other devices see as dashed outlines labelled "from Kitchen cam", "from Simulated headset" and so on (even behind walls), and the phone's mini map. There's no video in the simulator, so the picture is a sketch of the room. Pick the phone from the list; turn the panel off with **Phone view** in the panel on the right.
+- **Real calibration.** The simulated phones calibrate the way real ones do: a simulated wearer walks around each room and the same walk-calibration code solves each camera's pose, so what you see includes realistic error (typically 10–40 cm in camera position; about 10–30 cm in object position). The message at start shows each camera's error, and outlines in the phone view sit slightly off for the same reason.
+
+## Your setup: Quest 3 and iPhones
+
+A step-by-step for one Quest 3 / 3S headset and iPhones as cameras. You need a computer on the same Wi-Fi to run the relay (Windows, Mac or Linux with [Node.js](https://nodejs.org) 18 or newer).
+
+**Why this order:** the headset creates the map, and each iPhone then finds its place on that map by watching you walk while you wear the headset. iPhones can't run AR in a browser (Safari has no WebXR), so they're fixed cameras: put each one where it will stay.
+
+### 1. Start the relay on the computer
+
+```powershell
+cd server
+npm install
+npm run cert      # once: a certificate for this computer's network address
+npm start
+```
+
+It prints an address like `https://192.168.1.20:8443/`. Use that address (with your number) on the headset and every iPhone. The GitHub Pages link can't reach your relay: it has to be this `https://` address.
+
+### 2. Headset: open the viewer and make the map
+
+1. On the Quest, open the **Quest Browser** and go to `https://192.168.1.20:8443/viewer.html`.
+2. The browser warns about the certificate. Choose **Advanced → Proceed**. (Once per device.)
+3. Type a room code (or keep the one shown) and press **Connect**. The pill at the top should say the room and "relay".
+4. Press **Enter AR**. Allow anything it asks for (spatial data, hand tracking).
+5. A panel appears. Its **Map** section says *"This headset is now the map."* That's it: no markers, nothing to touch. The headset remembers this between sessions.
+
+Point a controller at the panel and pull the trigger to press buttons. Squeeze a grip to bring the panel back in front of you.
+
+### 3. Each iPhone: start the camera
+
+1. In **Safari**, go to `https://192.168.1.20:8443/node.html`.
+2. Safari says *"This connection is not private"*. Tap **Show Details → visit this website**, then confirm.
+3. Enter the **same room code** as the headset and a name like "Kitchen".
+4. Tick the ownership box, choose **Back camera**, and tap **Start camera**. Allow camera access.
+5. Put the iPhone where it will stay, looking at the area you want to watch: a shelf or tripod, ideally above head height looking slightly down. Plug it in to charge.
+
+Keep the screen on: the page asks iOS to keep it awake, but also set **Settings → Display & Brightness → Auto-Lock → Never** while it's running as a camera.
+
+### 4. Calibrate each iPhone by walking
+
+With the headset on and in AR (its panel says it's on the map):
+
+1. Put the headset on first, in AR. Then tap **Calibrate** on the iPhone. (If the headset isn't on the map yet, the iPhone says so.)
+2. Walk slowly around in front of that iPhone for 15–30 seconds. Cross the picture from side to side, and walk towards it and away from it too. Keep your whole body, head to feet, in the picture. Nobody else should be in view.
+3. The bar fills and the iPhone shows **Calibrated** with its position and field of view. If it asks you to cover more ground or walk towards it, keep going.
+
+Do this once per iPhone. After that, don't move the iPhone. If you move it, tap **Calibrate** again.
+
+### 5. Use it
+
+- **In the headset:** people and objects the iPhones see show as glowing outlines through the walls, with a mini map at the top left of your view. Turn on **Headset camera** in the panel to share what the headset sees with the iPhones too (if your Quest Browser allows it).
+- **On each iPhone:** its own detections are solid boxes. What the headset and the other iPhones see shows as dashed outlines, plus the mini map at the top left.
+
+### Next time
+
+Start the relay, open the viewer on the Quest and enter AR: it lands on the same map. Open `node.html` on each iPhone and tap **Start camera**; their calibration is saved. If the headset says it has no saved place on the map, walk in front of any calibrated iPhone and it finds itself again.
+
+### If something's wrong
+
+| Problem | Fix |
+| --- | --- |
+| **"AR not supported"** | Use the Quest Browser on the Quest, and the `https://` relay address. Desktop and iPhone browsers can't do AR. |
+| iPhone page loads but the pill says "not connected" | Make sure the room code matches and the relay is still running. If it keeps failing, Safari may not trust the certificate for the connection: install it with mkcert (below) instead of tapping through the warning. |
+| Calibration never finishes | Make sure only you are in the picture and your feet are visible. Walk across the picture *and* towards and away from the iPhone. Check the headset panel says it's on the map. |
+| Outlines in the wrong place | Re-calibrate the iPhone that's off. If everything is off, press **Re-find me** in the headset panel and walk in front of a calibrated iPhone. |
+| Headset says "Another device started a new map" | Someone pressed **New map**. Calibrate every iPhone again. |
+
+**No certificate warnings (optional):** install [mkcert](https://github.com/FiloSottile/mkcert) on the computer, run `mkcert -install` and `mkcert -key-file server/certs/key.pem -cert-file server/certs/cert.pem localhost 192.168.1.20` (your address). For each iPhone, AirDrop the file from `mkcert -CAROOT` named `rootCA.pem`, install it in **Settings → General → VPN & Device Management**, then turn it on in **Settings → General → About → Certificate Trust Settings**.
+
+## Real hardware setup (any devices)
+
+The same steps in general form, including laptops, Python cameras (Pi, USB, IP cameras) and options.
 
 ### 1. Run the relay with HTTPS
 
@@ -203,3 +279,4 @@ To test the browser node without a camera, open `node.html?synthetic=1`. It rend
 | 4. Multi-room | Each camera calibrates in its own room by walk; the headset's tracking carries the map between rooms. Needs a walk-through on a Quest. |
 | 5. Polish | Duplicate fusion, persistent anchors and FOV estimation are done. Ideas for next: WebXR depth-sensing occlusion when x-ray is off, and multi-camera triangulation. |
 | 6. Two-way sharing + mini map | Phone ↔ headset sharing, mini maps and dashed outlines tested in a browser through the relay (desktop viewer + simulator + synthetic phone node). **Headset camera detection not yet tried on a physical Quest.** |
+| 7. Simulator: headset + phone view | A simulated headset wearer walks the house and shares detections; the phone view panel shows what a phone draws. Tested in a browser through the relay. |
